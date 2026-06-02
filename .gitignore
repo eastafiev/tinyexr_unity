@@ -6,3 +6,5 @@ test/unit/tester-v2
 test/unit/tester-v3
 test/unit/*.exr
 test/unit/*.o
+out/
+CMakeSettings.json
