@@ -1,0 +1,146 @@
+# Unity TinyEXR Plugin CMake Configuration
+cmake_minimum_required(VERSION 3.5)
+
+# Source files
+set(PLUGIN_SOURCES
+    native/unity_tinyexr_plugin.cpp
+)
+
+set(PLUGIN_HEADERS
+    native/unity_tinyexr_plugin.h
+    ${CMAKE_SOURCE_DIR}/tinyexr.h
+)
+
+# Compression library
+if(USE_MINIZ)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/miniz.c")
+        list(APPEND PLUGIN_SOURCES ${CMAKE_SOURCE_DIR}/miniz.c)
+        message(STATUS "Unity Plugin: Using miniz for compression")
+    else()
+        message(WARNING "miniz.c not found, trying system zlib")
+        set(USE_MINIZ OFF CACHE BOOL "Use miniz" FORCE)
+    endif()
+endif()
+
+if(NOT USE_MINIZ)
+    find_package(ZLIB REQUIRED)
+    message(STATUS "Unity Plugin: Using system zlib: ${ZLIB_LIBRARIES}")
+endif()
+
+# Create shared library (DLL/SO/DYLIB)
+add_library(UnityTinyEXR SHARED ${PLUGIN_SOURCES})
+
+# Include directories
+target_include_directories(UnityTinyEXR PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/native
+    ${CMAKE_SOURCE_DIR}
+)
+
+# Link libraries
+if(NOT USE_MINIZ)
+    target_link_libraries(UnityTinyEXR PRIVATE ZLIB::ZLIB)
+endif()
+
+# Compile definitions
+target_compile_definitions(UnityTinyEXR PRIVATE
+    UNITY_TINYEXR_EXPORTS=1
+    $<$<BOOL:${USE_MINIZ}>:TINYEXR_USE_MINIZ=1>
+)
+
+# Platform-specific settings
+if(WIN32)
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX ""
+        SUFFIX ".dll"
+    )
+elseif(APPLE)
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX "lib"
+        SUFFIX ".bundle"
+        MACOSX_RPATH ON
+        BUILD_WITH_INSTALL_RPATH ON
+        INSTALL_NAME_DIR "@rpath"
+    )
+else()
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX "lib"
+        SUFFIX ".so"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
+
+# Output directory
+set_target_properties(UnityTinyEXR PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Unity project deployment
+if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
+    # Platform-specific plugin directory
+    if(WIN32)
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/x86_64")
+    elseif(APPLE)
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/macOS")
+    else()
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
+    endif()
+    
+    file(MAKE_DIRECTORY "${UNITY_PLATFORM_DIR}")
+    
+    # Copy plugin DLL/SO after build
+    add_custom_command(TARGET UnityTinyEXR POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:UnityTinyEXR>
+            "${UNITY_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
+        COMMENT "Deploying plugin to: ${UNITY_PLATFORM_DIR}"
+    )
+    
+    # Copy C# wrapper
+    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
+    file(MAKE_DIRECTORY "${UNITY_SCRIPTS_DIR}")
+    
+    set(CSHARP_FILES
+        csharp/TinyEXRLoader.cs
+    )
+    
+    foreach(CS_FILE ${CSHARP_FILES})
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CS_FILE}")
+            get_filename_component(CS_NAME ${CS_FILE} NAME)
+            add_custom_command(TARGET UnityTinyEXR POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy
+                    "${CMAKE_CURRENT_SOURCE_DIR}/${CS_FILE}"
+                    "${UNITY_SCRIPTS_DIR}/${CS_NAME}"
+                COMMENT "Deploying ${CS_NAME} to Unity scripts"
+            )
+        endif()
+    endforeach()
+    
+    message(STATUS "Unity deployment: ${UNITY_PLATFORM_DIR}")
+endif()
+
+# Install rules
+install(TARGETS UnityTinyEXR
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+)
+
+# Print configuration
+message(STATUS "----------------------------------------------")
+message(STATUS "Unity Plugin Build Configuration")
+message(STATUS "----------------------------------------------")
+if(WIN32)
+    message(STATUS "Output file: UnityTinyEXR.dll")
+elseif(APPLE)
+    message(STATUS "Output file: libUnityTinyEXR.bundle")
+else()
+    message(STATUS "Output file: libUnityTinyEXR.so")
+endif()
+message(STATUS "Output directory: ${CMAKE_BINARY_DIR}/bin")
+if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
+    message(STATUS "Unity deploy directory: ${UNITY_PLATFORM_DIR}")
+endif()
+message(STATUS "----------------------------------------------")
