@@ -7,7 +7,23 @@ test/unit/tester-v3
 test/unit/*.exr
 test/unit/*.o
 out/
+Release/
 CMakeSettings.json
 build_vs/
 CMakeFiles/
 build_unity/
+build_plugin/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# CMake generated files (in-source builds)
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+build.ninja
+.ninja_deps
+.ninja_log
+*.tlog

@@ -55,6 +55,16 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithOptionsForUnity(
     char** outErrorMsg
 );
 
+UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
+    const char* filename,
+    int targetWidth,
+    int targetHeight,
+    float** outData,
+    UnityImageInfo* outInfo,
+    UnityConversionOptions* options,
+    char** outErrorMsg
+);
+
 UNITY_TINYEXR_API int UNITY_CALL LoadEXRLayerForUnity(
     const char* filename,
     const char* layerName,

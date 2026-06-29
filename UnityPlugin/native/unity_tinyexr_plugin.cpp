@@ -46,6 +46,43 @@ static void ApplyGamma(float* data, int width, int height, int channels, float g
     }
 }
 
+// Helper: Bilinear resize
+static float* ResizeBilinear(const float* srcData, int srcWidth, int srcHeight, int targetWidth, int targetHeight, int channels) {
+    float* dstData = new float[targetWidth * targetHeight * channels];
+    
+    float xRatio = static_cast<float>(srcWidth) / targetWidth;
+    float yRatio = static_cast<float>(srcHeight) / targetHeight;
+    
+    for (int y = 0; y < targetHeight; y++) {
+        for (int x = 0; x < targetWidth; x++) {
+            float srcX = x * xRatio;
+            float srcY = y * yRatio;
+            
+            int x0 = static_cast<int>(srcX);
+            int y0 = static_cast<int>(srcY);
+            int x1 = std::min(x0 + 1, srcWidth - 1);
+            int y1 = std::min(y0 + 1, srcHeight - 1);
+            
+            float xWeight = srcX - x0;
+            float yWeight = srcY - y0;
+            
+            for (int c = 0; c < channels; c++) {
+                float p00 = srcData[(y0 * srcWidth + x0) * channels + c];
+                float p10 = srcData[(y0 * srcWidth + x1) * channels + c];
+                float p01 = srcData[(y1 * srcWidth + x0) * channels + c];
+                float p11 = srcData[(y1 * srcWidth + x1) * channels + c];
+                
+                float top = p00 * (1.0f - xWeight) + p10 * xWeight;
+                float bottom = p01 * (1.0f - xWeight) + p11 * xWeight;
+                
+                dstData[(y * targetWidth + x) * channels + c] = top * (1.0f - yWeight) + bottom * yWeight;
+            }
+        }
+    }
+    
+    return dstData;
+}
+
 // Helper: Extract layer names from channels
 static void ExtractLayers(const EXRHeader& header, std::vector<std::string>& layerNames) {
     std::set<std::string> uniqueLayers;
@@ -345,6 +382,93 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRLayerInfo(
     }
 
     FreeEXRHeader(&exrHeader);
+    if (outErrorMsg) *outErrorMsg = nullptr;
+    return TINYEXR_SUCCESS;
+}
+
+// Load EXR with resize
+UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
+    const char* filename,
+    int targetWidth,
+    int targetHeight,
+    float** outData,
+    UnityImageInfo* outInfo,
+    UnityConversionOptions* options,
+    char** outErrorMsg
+) {
+    if (!filename || !outData || !outInfo || !options) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid parameters");
+        }
+        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    }
+
+    if (targetWidth <= 0 || targetHeight <= 0) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid target dimensions");
+        }
+        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    }
+
+    float* rgba = nullptr;
+    int width = 0;
+    int height = 0;
+    const char* err = nullptr;
+
+    int ret = LoadEXR(&rgba, &width, &height, filename, &err);
+
+    if (ret != TINYEXR_SUCCESS) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString(err ? err : "Unknown error loading EXR");
+        }
+        if (err) FreeEXRErrorMessage(err);
+        return ret;
+    }
+
+    // Resize if needed
+    float* resizedData = rgba;
+    if (width != targetWidth || height != targetHeight) {
+        resizedData = ResizeBilinear(rgba, width, height, targetWidth, targetHeight, 4);
+        free(rgba);
+        rgba = nullptr;
+    }
+
+    // Apply gamma correction
+    if (options->gammaCorrection != 1.0f) {
+        ApplyGamma(resizedData, targetWidth, targetHeight, 4, options->gammaCorrection);
+    }
+
+    // Flip vertically for Unity
+    if (options->flipY) {
+        FlipVertical(resizedData, targetWidth, targetHeight, 4);
+    }
+
+    // Handle channel conversion
+    if (options->targetChannels == 3) {
+        float* rgb = new float[targetWidth * targetHeight * 3];
+        for (int i = 0; i < targetWidth * targetHeight; i++) {
+            rgb[i * 3 + 0] = resizedData[i * 4 + 0];
+            rgb[i * 3 + 1] = resizedData[i * 4 + 1];
+            rgb[i * 3 + 2] = resizedData[i * 4 + 2];
+        }
+        if (rgba != nullptr) {
+            free(resizedData);
+        } else {
+            delete[] resizedData;
+        }
+        resizedData = rgb;
+        outInfo->numChannels = 3;
+        outInfo->hasAlpha = 0;
+    } else {
+        outInfo->numChannels = 4;
+        outInfo->hasAlpha = 1;
+    }
+
+    outInfo->width = targetWidth;
+    outInfo->height = targetHeight;
+    outInfo->pixelType = 2; // FLOAT
+
+    *outData = resizedData;
     if (outErrorMsg) *outErrorMsg = nullptr;
     return TINYEXR_SUCCESS;
 }

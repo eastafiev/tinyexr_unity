@@ -1,78 +1,142 @@
-# this cmake file is for compile tests.
-# Not usable for your cmake app.
 cmake_minimum_required(VERSION 3.5)
+project(UnityTinyEXRPlugin VERSION 1.0.0 LANGUAGES C CXX)
 
-set(BUILD_TARGET "tinyexr")
-set(SAMPLE_TARGET "test_tinyexr")
-
-project(${BUILD_TARGET} CXX)
-
-# options
-option(TINYEXR_BUILD_SAMPLE "Build a sample" ON)
-option(TINYEXR_USE_MINIZ "Use miniz" ON)
-
-# cmake modules
-list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
-list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/sanitizers)
-find_package(Sanitizers) # Address sanitizer (-DSANITIZE_ADDRESS=ON)
-
-# Require strict C++11 mode(e.g. `-std=c++11`)
+# C++11 standard
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+# Options
+option(USE_MINIZ "Use miniz instead of system zlib" ON)
+set(UNITY_PROJECT_PATH "" CACHE PATH "Path to Unity project for deployment")
 
-set(TINYEXR_SOURCES
-    ${PROJECT_SOURCE_DIR}/tinyexr.cc
-    )
+# Source files
+set(PLUGIN_SOURCES
+    UnityPlugin/native/unity_tinyexr_plugin.cpp
+)
 
-if(TINYEXR_USE_MINIZ)
-  enable_language(C)
-  add_library(miniz STATIC deps/miniz/miniz.c)
-  target_include_directories(miniz PUBLIC deps/miniz)
-  set_target_properties(miniz PROPERTIES FOLDER "deps")
-  list(APPEND TINYEXR_EXT_LIBRARIES miniz)
+set(PLUGIN_HEADERS
+    UnityPlugin/native/unity_tinyexr_plugin.h
+    tinyexr.h
+)
+
+# Compression library
+if(USE_MINIZ)
+    set(MINIZ_PATH "${CMAKE_CURRENT_SOURCE_DIR}/deps/miniz/miniz.c")
+    if(EXISTS "${MINIZ_PATH}")
+        list(APPEND PLUGIN_SOURCES ${MINIZ_PATH})
+        message(STATUS "Using miniz from ${MINIZ_PATH}")
+    else()
+        message(WARNING "miniz.c not found at ${MINIZ_PATH}, using system zlib")
+        set(USE_MINIZ OFF)
+    endif()
 endif()
 
-add_library(${BUILD_TARGET} ${TINYEXR_SOURCES} ${TINYEXR_DEP_SOURCES})
-add_sanitizers(${BUILD_TARGET})
+if(NOT USE_MINIZ)
+    find_package(ZLIB REQUIRED)
+    message(STATUS "Using system zlib: ${ZLIB_LIBRARIES}")
+endif()
 
-target_include_directories(${BUILD_TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${BUILD_TARGET} ${TINYEXR_EXT_LIBRARIES} ${CMAKE_DL_LIBS})
+# Create DLL
+add_library(UnityTinyEXR SHARED ${PLUGIN_SOURCES})
 
-# Increase warning level for clang.
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
-  set(CLANG_COMPILE_FLAGS "-Weverything -Werror -Wno-padded -Wno-c++98-compat-pedantic -Wno-documentation -Wno-unused-member-function")
-  if (${CMAKE_CXX_COMPILER_VERSION} VERSION_GREATER 16)
-    set(CLANG_COMPILE_FLAGS "${CLANG_COMPILE_FLAGS} -Wno-unsafe-buffer-usage")
-  endif()
-  set_source_files_properties(${TINYEXR_SOURCES} PROPERTIES COMPILE_FLAGS ${CLANG_COMPILE_FLAGS})
-endif ()
+# Includes
+target_include_directories(UnityTinyEXR PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/native
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/miniz
+)
 
-if (TINYEXR_BUILD_SAMPLE)
+# Link
+if(NOT USE_MINIZ)
+    target_link_libraries(UnityTinyEXR PRIVATE ZLIB::ZLIB)
+endif()
 
-  set(TINYEXR_SAMPLE_SOURCES
-      ${PROJECT_SOURCE_DIR}/test_tinyexr.cc
-      )
+# Definitions
+target_compile_definitions(UnityTinyEXR PRIVATE
+    UNITY_TINYEXR_EXPORTS=1
+    $<$<BOOL:${USE_MINIZ}>:TINYEXR_USE_MINIZ=1>
+)
 
-  add_executable(${SAMPLE_TARGET} ${TINYEXR_SAMPLE_SOURCES})
-  target_link_libraries(${SAMPLE_TARGET} ${TINYEXR_EXT_LIBRARIES})
-  add_sanitizers(${SAMPLE_TARGET})
-  if (WIN32)
-    target_compile_definitions(${SAMPLE_TARGET} PUBLIC UNICODE)
-    target_compile_definitions(${SAMPLE_TARGET} PUBLIC _UNICODE)
+if(MSVC)
+    target_compile_definitions(UnityTinyEXR PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+endif()
 
-    # Set ${SAMPLE_TARGET} as a startup project for VS IDE
-    set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${SAMPLE_TARGET})
+# Platform-specific
+if(WIN32)
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX ""
+        SUFFIX ".dll"
+    )
+elseif(APPLE)
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX "lib"
+        SUFFIX ".bundle"
+        MACOSX_RPATH ON
+    )
+else()
+    set_target_properties(UnityTinyEXR PROPERTIES
+        OUTPUT_NAME "UnityTinyEXR"
+        PREFIX "lib"
+        SUFFIX ".so"
+        POSITION_INDEPENDENT_CODE ON
+    )
+endif()
 
-    # For easier debugging in VS IDE(cmake 3.8.0 or later required) Set working
-    # directory to ${BUILD_TARGET} git repo root.
-    if(CMAKE_VERSION VERSION_GREATER 3.8.0)
-      set_target_properties(${SAMPLE_TARGET}
-              PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY
-              "${CMAKE_CURRENT_SOURCE_DIR}")
+# Output directory
+set_target_properties(UnityTinyEXR PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Unity deployment
+if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
+    if(WIN32)
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/x86_64")
+    elseif(APPLE)
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/macOS")
+    else()
+        set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
     endif()
-  endif(WIN32)
+    
+    file(MAKE_DIRECTORY "${UNITY_PLATFORM_DIR}")
+    
+    add_custom_command(TARGET UnityTinyEXR POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy
+            $<TARGET_FILE:UnityTinyEXR>
+            "${UNITY_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
+        COMMENT "Deploying to: ${UNITY_PLATFORM_DIR}"
+    )
+    
+    # Copy C# wrapper
+    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
+    file(MAKE_DIRECTORY "${UNITY_SCRIPTS_DIR}")
+    
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs")
+        add_custom_command(TARGET UnityTinyEXR POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs"
+                "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
+            COMMENT "Deploying C# wrapper"
+        )
+    endif()
+    
+    message(STATUS "Unity deployment: ${UNITY_PLATFORM_DIR}")
+endif()
 
-endif (TINYEXR_BUILD_SAMPLE)
+# Print info
+message(STATUS "==========================================")
+message(STATUS "Unity TinyEXR Plugin Configuration")
+message(STATUS "==========================================")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Output: ${CMAKE_BINARY_DIR}/bin")
+if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
+    message(STATUS "Unity deploy: ${UNITY_PLATFORM_DIR}")
+endif()
+message(STATUS "==========================================")

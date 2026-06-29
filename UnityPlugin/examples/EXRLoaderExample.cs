@@ -14,13 +14,74 @@ public class EXRLoaderExample : MonoBehaviour
     [SerializeField] private bool loadAsLinear = true;
     [SerializeField] private float gammaCorrection = 1.0f;
 
+    [Header("Resize Settings")]
+    [Tooltip("Enable to resize the texture during load")]
+    [SerializeField] private bool enableResize = false;
+    [SerializeField] private int targetWidth = 1024;
+    [SerializeField] private int targetHeight = 1024;
+    [Tooltip("Use async loading (recommended for large images or resize operations)")]
+    [SerializeField] private bool useAsyncLoading = false;
+
     [Header("Display")]
     [SerializeField] private Renderer targetRenderer;
     [SerializeField] private bool showInfo = true;
 
     private void Start()
     {
-        LoadAndDisplayEXR();
+        if (useAsyncLoading && enableResize)
+        {
+            LoadAndDisplayEXRAsync();
+        }
+        else
+        {
+            LoadAndDisplayEXR();
+        }
+    }
+
+    private async void LoadAndDisplayEXRAsync()
+    {
+        string filePath = Path.Combine(Application.streamingAssetsPath, exrFileName);
+
+        if (!File.Exists(filePath))
+        {
+            Debug.LogError($"EXR file not found: {filePath}");
+            return;
+        }
+
+        try
+        {
+            // Get original image size first
+            Vector2Int originalSize = TinyEXRLoader.GetImageSize(filePath);
+            Debug.Log($"?? Original EXR Size: {originalSize.x}x{originalSize.y}");
+
+            if (enableResize)
+            {
+                Debug.Log($"?? Resizing to: {targetWidth}x{targetHeight}");
+            }
+
+            // Load with async resize
+            Texture2D texture = await TinyEXRLoader.LoadEXRAsync(filePath, targetWidth, targetHeight, loadAsLinear);
+
+            Debug.Log($"? Loaded EXR: {texture.width}x{texture.height}, Format: {texture.format}");
+
+            // Display info
+            if (showInfo)
+            {
+                var info = TinyEXRLoader.GetInfo(filePath);
+                Debug.Log($"  Channels: {info.numChannels}, Has Alpha: {info.hasAlpha != 0}");
+            }
+
+            // Apply to renderer
+            if (targetRenderer != null)
+            {
+                targetRenderer.material.mainTexture = texture;
+                Debug.Log("??? Applied texture to renderer");
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"Failed to load EXR: {e.Message}");
+        }
     }
 
     private void LoadAndDisplayEXR()
@@ -39,10 +100,21 @@ public class EXRLoaderExample : MonoBehaviour
             Vector2Int size = TinyEXRLoader.GetImageSize(filePath);
             Debug.Log($"?? EXR Size: {size.x}x{size.y}");
 
-            // Option 1: Simple load
-            Texture2D texture = TinyEXRLoader.LoadEXR(filePath, loadAsLinear);
+            Texture2D texture;
 
-            // Option 2: Load with custom options
+            if (enableResize)
+            {
+                // Option 1: Load with resize (synchronous)
+                Debug.Log($"?? Resizing to: {targetWidth}x{targetHeight}");
+                texture = TinyEXRLoader.LoadEXR(filePath, targetWidth, targetHeight, loadAsLinear);
+            }
+            else
+            {
+                // Option 2: Simple load without resize
+                texture = TinyEXRLoader.LoadEXR(filePath, loadAsLinear);
+            }
+
+            // Option 3: Load with custom options
             /*
             var options = new TinyEXRLoader.ConversionOptions
             {
@@ -50,7 +122,15 @@ public class EXRLoaderExample : MonoBehaviour
                 targetChannels = 4,
                 gammaCorrection = gammaCorrection
             };
-            Texture2D texture = TinyEXRLoader.LoadEXRWithOptions(filePath, options);
+            
+            if (enableResize)
+            {
+                texture = TinyEXRLoader.LoadEXRWithResize(filePath, targetWidth, targetHeight, options);
+            }
+            else
+            {
+                texture = TinyEXRLoader.LoadEXRWithOptions(filePath, options);
+            }
             */
 
             Debug.Log($"? Loaded EXR: {texture.width}x{texture.height}, Format: {texture.format}");

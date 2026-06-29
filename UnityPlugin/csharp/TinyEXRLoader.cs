@@ -1,4 +1,5 @@
 using System;
+using System;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
@@ -78,6 +79,17 @@ namespace TinyEXR
         );
 
         [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
+        private static extern int LoadEXRWithResizeForUnity(
+            [MarshalAs(UnmanagedType.LPStr)] string filename,
+            int targetWidth,
+            int targetHeight,
+            out IntPtr outData,
+            out ImageInfo outInfo,
+            ref ConversionOptions options,
+            out IntPtr outErrorMsg
+        );
+
+        [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
         private static extern int LoadEXRLayerForUnity(
             [MarshalAs(UnmanagedType.LPStr)] string filename,
             [MarshalAs(UnmanagedType.LPStr)] string layerName,
@@ -147,6 +159,126 @@ namespace TinyEXR
                 if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
                 if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
             }
+        }
+
+        /// <summary>
+        /// Load EXR file with resize (synchronous)
+        /// </summary>
+        public static Texture2D LoadEXR(string filePath, int width, int height, bool linear = true)
+        {
+            var options = linear ? ConversionOptions.Linear : ConversionOptions.SRGB;
+            return LoadEXRWithResize(filePath, width, height, options);
+        }
+
+        /// <summary>
+        /// Load EXR file with resize and custom options (synchronous)
+        /// </summary>
+        public static Texture2D LoadEXRWithResize(string filePath, int width, int height, ConversionOptions options)
+        {
+            IntPtr dataPtr = IntPtr.Zero;
+            IntPtr errorPtr = IntPtr.Zero;
+
+            try
+            {
+                ImageInfo info;
+                int result = LoadEXRWithResizeForUnity(filePath, width, height, out dataPtr, out info, ref options, out errorPtr);
+
+                if (result != 0)
+                {
+                    string errorMsg = GetErrorMessage(errorPtr);
+                    throw new Exception($"Failed to load EXR with resize: {errorMsg}");
+                }
+
+                return CreateTexture(dataPtr, info, options.gammaCorrection == 1.0f);
+            }
+            finally
+            {
+                if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
+                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+            }
+        }
+
+        /// <summary>
+        /// Load EXR file with resize asynchronously (Unity-friendly)
+        /// </summary>
+        public static async System.Threading.Tasks.Task<Texture2D> LoadEXRAsync(string filePath, int width, int height, bool linear = true)
+        {
+            var options = linear ? ConversionOptions.Linear : ConversionOptions.SRGB;
+            return await LoadEXRWithResizeAsync(filePath, width, height, options);
+        }
+
+        /// <summary>
+        /// Load EXR file with resize and custom options asynchronously (Unity-friendly)
+        /// </summary>
+        public static async System.Threading.Tasks.Task<Texture2D> LoadEXRWithResizeAsync(string filePath, int width, int height, ConversionOptions options)
+        {
+            // Run the heavy loading operation on a background thread
+            var loadTask = System.Threading.Tasks.Task.Run(() =>
+            {
+                IntPtr dataPtr = IntPtr.Zero;
+                IntPtr errorPtr = IntPtr.Zero;
+
+                try
+                {
+                    ImageInfo info;
+                    int result = LoadEXRWithResizeForUnity(filePath, width, height, out dataPtr, out info, ref options, out errorPtr);
+
+                    if (result != 0)
+                    {
+                        string errorMsg = GetErrorMessage(errorPtr);
+                        throw new Exception($"Failed to load EXR with resize: {errorMsg}");
+                    }
+
+                    // Copy data to managed array before freeing native memory
+                    int pixelCount = info.width * info.height * info.numChannels;
+                    float[] pixels = new float[pixelCount];
+                    Marshal.Copy(dataPtr, pixels, 0, pixelCount);
+
+                    return (pixels, info, options.gammaCorrection == 1.0f);
+                }
+                finally
+                {
+                    if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
+                    if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+                }
+            });
+
+            var (pixels, info, linear) = await loadTask;
+
+            // Create texture on main thread (Unity requirement)
+            Texture2D texture = new Texture2D(info.width, info.height, TextureFormat.RGBAFloat, false, linear);
+
+            Color[] colors = new Color[info.width * info.height];
+            for (int i = 0; i < colors.Length; i++)
+            {
+                int idx = i * info.numChannels;
+                switch (info.numChannels)
+                {
+                    case 1:
+                    {
+                        float l = pixels[idx + 0];
+                        colors[i] = new Color(l, l, l, 1.0f);
+                        break;
+                    }
+                    case 2:
+                    {
+                        float l = pixels[idx + 0];
+                        float a = pixels[idx + 1];
+                        colors[i] = new Color(l, l, l, a);
+                        break;
+                    }
+                    case 3:
+                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], 1.0f);
+                        break;
+                    case 4:
+                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
+                        break;
+                }
+            }
+            texture.SetPixels(colors);
+            texture.Apply();
+
+            return texture;
         }
 
         /// <summary>
@@ -256,8 +388,10 @@ namespace TinyEXR
 
         private static Texture2D CreateTexture(IntPtr dataPtr, ImageInfo info, bool linear)
         {
-            TextureFormat format = info.numChannels == 4 ? TextureFormat.RGBAFloat : TextureFormat.RGBFloat;
-            Texture2D texture = new Texture2D(info.width, info.height, format, false, linear);
+            if (info.numChannels < 1 || info.numChannels > 4)
+                throw new NotSupportedException($"Unsupported EXR channel count: {info.numChannels}. Expected 1-4 channels.");
+
+            Texture2D texture = new Texture2D(info.width, info.height, TextureFormat.RGBAFloat, false, linear);
 
             int pixelCount = info.width * info.height * info.numChannels;
             float[] pixels = new float[pixelCount];
@@ -267,12 +401,28 @@ namespace TinyEXR
             for (int i = 0; i < colors.Length; i++)
             {
                 int idx = i * info.numChannels;
-                colors[i] = new Color(
-                    pixels[idx + 0],
-                    pixels[idx + 1],
-                    pixels[idx + 2],
-                    info.numChannels == 4 ? pixels[idx + 3] : 1.0f
-                );
+                switch (info.numChannels)
+                {
+                    case 1:
+                        {
+                            float l = pixels[idx + 0];
+                            colors[i] = new Color(l, l, l, 1.0f);
+                            break;
+                        }
+                    case 2:
+                        {
+                            float l = pixels[idx + 0];
+                            float a = pixels[idx + 1];
+                            colors[i] = new Color(l, l, l, a);
+                            break;
+                        }
+                    case 3:
+                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], 1.0f);
+                        break;
+                    case 4:
+                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
+                        break;
+                }
             }
 
             texture.SetPixels(colors);
