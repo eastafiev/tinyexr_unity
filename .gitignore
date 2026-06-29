@@ -8,3 +8,6 @@ test/unit/*.exr
 test/unit/*.o
 out/
 CMakeSettings.json
+build_vs/
+CMakeFiles/
+build_unity/
