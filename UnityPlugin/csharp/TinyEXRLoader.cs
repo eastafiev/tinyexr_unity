@@ -109,9 +109,9 @@ namespace TinyEXR
                     case ExrSupportReason.NotExr:
                         return "Invalid EXR file.";
                     case ExrSupportReason.Multipart:
-                        return "Loading multipart or DeepImage is not supported in LoadEXR() API.";
+                        return "Loading multipart or DeepImage is not supported yet";
                     case ExrSupportReason.DeepImage:
-                        return "Loading multipart or DeepImage is not supported in LoadEXR() API.";
+                        return "Loading multipart or DeepImage is not supported yet.";
                     case ExrSupportReason.RequiresLayer:
                         return "EXR contains layered channels; use LoadLayer() with a layer name.";
                     case ExrSupportReason.LayerNotFound:

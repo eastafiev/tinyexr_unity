@@ -375,24 +375,14 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRCompatibilityForUnity(
         return TINYEXR_ERROR_UNSUPPORTED_FORMAT;
     }
 
-    // Layered channels require LoadEXRWithLayer()
+    // Layered channels are supported via LoadEXRLayerForUnity()
     std::vector<std::string> layers;
     ExtractLayers(exrHeader, layers);
     outInfo->hasLayers = layers.empty() ? 0 : 1;
     outInfo->layerCount = static_cast<int>(layers.size());
 
-    if (!layers.empty()) {
-        if (layerName == nullptr || layerName[0] == '\0') {
-            outInfo->isSupported = 0;
-            outInfo->reason = UNITY_EXR_SUPPORT_REQUIRES_LAYER;
-            FreeEXRHeader(&exrHeader);
-            if (outErrorMsg) {
-                *outErrorMsg = DuplicateString(
-                    "EXR contains layered channels; use LoadLayer() with a layer name");
-            }
-            return TINYEXR_ERROR_LAYER_NOT_FOUND;
-        }
-
+    if (!layers.empty() && layerName != nullptr && layerName[0] != '\0') {
+        // When a layer name is provided, verify it exists before reporting supported.
         bool found = false;
         for (size_t i = 0; i < layers.size(); i++) {
             if (layers[i] == layerName) {
