@@ -100,6 +100,62 @@ static void ExtractLayers(const EXRHeader& header, std::vector<std::string>& lay
     layerNames.assign(uniqueLayers.begin(), uniqueLayers.end());
 }
 
+// Helper: Initialize compatibility info to defaults
+static void InitCompatibilityInfo(UnityExrCompatibilityInfo* info) {
+    memset(info, 0, sizeof(UnityExrCompatibilityInfo));
+    info->reason = UNITY_EXR_SUPPORT_OK;
+}
+
+// Helper: Fill dimensions from EXR header
+static void FillDimensionsFromHeader(const EXRHeader& header, UnityExrCompatibilityInfo* info) {
+    info->width = header.data_window.max_x - header.data_window.min_x + 1;
+    info->height = header.data_window.max_y - header.data_window.min_y + 1;
+    info->numChannels = header.num_channels;
+    info->compressionType = header.compression_type;
+    info->isTiled = header.tiled ? 1 : 0;
+}
+
+// Helper: Check if header has spectral layout attribute
+static bool HasSpectralLayout(const EXRHeader& header) {
+    for (int i = 0; i < header.num_custom_attributes; i++) {
+        if (strcmp(header.custom_attributes[i].name, "spectralLayoutVersion") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Helper: Check if compression type is supported by this build
+static bool IsCompressionSupported(int compressionType) {
+    if (compressionType == TINYEXR_COMPRESSIONTYPE_DWAA ||
+        compressionType == TINYEXR_COMPRESSIONTYPE_DWAB) {
+        return false;
+    }
+#if !TINYEXR_USE_ZFP
+    if (compressionType == TINYEXR_COMPRESSIONTYPE_ZFP) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+// Helper: Free multipart header array allocated by ParseEXRMultipartHeaderFromFile
+static void FreeMultipartHeaders(EXRHeader** headers, int numHeaders) {
+    if (!headers) return;
+    for (int i = 0; i < numHeaders; i++) {
+        if (headers[i]) {
+            FreeEXRHeader(headers[i]);
+            free(headers[i]);
+        }
+    }
+    free(headers);
+}
+
+// Helper: Check version flags that block LoadEXR()
+static bool IsMultipartOrDeep(const EXRVersion& version) {
+    return version.multipart != 0 || version.non_image != 0;
+}
+
 // Get EXR info without loading pixel data
 UNITY_TINYEXR_API int UNITY_CALL GetEXRInfo(
     const char* filename,
@@ -120,6 +176,15 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRInfo(
             *outErrorMsg = DuplicateString("Invalid EXR file");
         }
         return ret;
+    }
+
+    // Reject multipart/deep before parsing header (matches LoadEXR() gate)
+    if (IsMultipartOrDeep(exrVersion)) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString(
+                "Loading multipart or DeepImage is not supported  in LoadEXR() API");
+        }
+        return TINYEXR_ERROR_INVALID_DATA;
     }
 
     EXRHeader exrHeader;
@@ -151,6 +216,167 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRInfo(
     }
 
     FreeEXRHeader(&exrHeader);
+    if (outErrorMsg) *outErrorMsg = nullptr;
+    return TINYEXR_SUCCESS;
+}
+
+// Get load compatibility without decoding pixel data
+UNITY_TINYEXR_API int UNITY_CALL GetEXRCompatibilityForUnity(
+    const char* filename,
+    const char* layerName,
+    UnityExrCompatibilityInfo* outInfo,
+    char** outErrorMsg
+) {
+    if (!filename || !outInfo) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid parameters");
+        }
+        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    }
+
+    InitCompatibilityInfo(outInfo);
+
+    EXRVersion exrVersion;
+    int ret = ParseEXRVersionFromFile(&exrVersion, filename);
+    if (ret != TINYEXR_SUCCESS) {
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_NOT_EXR;
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid EXR file");
+        }
+        return ret;
+    }
+
+    outInfo->isMultipart = exrVersion.multipart ? 1 : 0;
+    outInfo->isDeepImage = exrVersion.non_image ? 1 : 0;
+    outInfo->isTiled = exrVersion.tiled ? 1 : 0;
+
+    // Multipart files are not supported by LoadEXR()
+    if (exrVersion.multipart) {
+        const char* err = nullptr;
+        EXRHeader** mpHeaders = nullptr;
+        int numParts = 0;
+        ret = ParseEXRMultipartHeaderFromFile(&mpHeaders, &numParts, &exrVersion, filename, &err);
+        if (ret == TINYEXR_SUCCESS && numParts > 0 && mpHeaders && mpHeaders[0]) {
+            FillDimensionsFromHeader(*mpHeaders[0], outInfo);
+        }
+        outInfo->partCount = numParts;
+        if (mpHeaders) {
+            FreeMultipartHeaders(mpHeaders, numParts);
+        }
+        if (err) FreeEXRErrorMessage(err);
+
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_MULTIPART;
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString(
+                "Loading multipart or DeepImage is not supported  in LoadEXR() API");
+        }
+        return TINYEXR_ERROR_INVALID_DATA;
+    }
+
+    // Deep image files are not supported by LoadEXR()
+    if (exrVersion.non_image) {
+        EXRHeader exrHeader;
+        InitEXRHeader(&exrHeader);
+        const char* err = nullptr;
+        ret = ParseEXRHeaderFromFile(&exrHeader, &exrVersion, filename, &err);
+        if (ret == TINYEXR_SUCCESS) {
+            FillDimensionsFromHeader(exrHeader, outInfo);
+            FreeEXRHeader(&exrHeader);
+        }
+        if (err) FreeEXRErrorMessage(err);
+
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_DEEP_IMAGE;
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString(
+                "Loading multipart or DeepImage is not supported  in LoadEXR() API");
+        }
+        return TINYEXR_ERROR_INVALID_DATA;
+    }
+
+    // Single-part regular image: parse header for full compatibility checks
+    EXRHeader exrHeader;
+    InitEXRHeader(&exrHeader);
+    const char* err = nullptr;
+
+    ret = ParseEXRHeaderFromFile(&exrHeader, &exrVersion, filename, &err);
+    if (ret != TINYEXR_SUCCESS) {
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_HEADER_ERROR;
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString(err ? err : "Failed to parse header");
+        }
+        if (err) FreeEXRErrorMessage(err);
+        return ret;
+    }
+
+    FillDimensionsFromHeader(exrHeader, outInfo);
+    outInfo->isTiled = exrHeader.tiled ? 1 : 0;
+
+    // Spectral EXR is not supported by the Unity loader path
+    if (HasSpectralLayout(exrHeader)) {
+        outInfo->isSpectral = 1;
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_SPECTRAL;
+        FreeEXRHeader(&exrHeader);
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Spectral EXR is not supported");
+        }
+        return TINYEXR_ERROR_UNSUPPORTED_FORMAT;
+    }
+
+    // Unsupported compression in this build
+    if (!IsCompressionSupported(exrHeader.compression_type)) {
+        outInfo->isSupported = 0;
+        outInfo->reason = UNITY_EXR_SUPPORT_COMPRESSION;
+        FreeEXRHeader(&exrHeader);
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Unsupported EXR compression type");
+        }
+        return TINYEXR_ERROR_UNSUPPORTED_FORMAT;
+    }
+
+    // Layered channels require LoadEXRWithLayer()
+    std::vector<std::string> layers;
+    ExtractLayers(exrHeader, layers);
+    outInfo->hasLayers = layers.empty() ? 0 : 1;
+    outInfo->layerCount = static_cast<int>(layers.size());
+
+    if (!layers.empty()) {
+        if (layerName == nullptr || layerName[0] == '\0') {
+            outInfo->isSupported = 0;
+            outInfo->reason = UNITY_EXR_SUPPORT_REQUIRES_LAYER;
+            FreeEXRHeader(&exrHeader);
+            if (outErrorMsg) {
+                *outErrorMsg = DuplicateString(
+                    "EXR contains layered channels; use LoadLayer() with a layer name");
+            }
+            return TINYEXR_ERROR_LAYER_NOT_FOUND;
+        }
+
+        bool found = false;
+        for (size_t i = 0; i < layers.size(); i++) {
+            if (layers[i] == layerName) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            outInfo->isSupported = 0;
+            outInfo->reason = UNITY_EXR_SUPPORT_LAYER_NOT_FOUND;
+            FreeEXRHeader(&exrHeader);
+            if (outErrorMsg) {
+                *outErrorMsg = DuplicateString("Layer Not Found");
+            }
+            return TINYEXR_ERROR_LAYER_NOT_FOUND;
+        }
+    }
+
+    FreeEXRHeader(&exrHeader);
+    outInfo->isSupported = 1;
+    outInfo->reason = UNITY_EXR_SUPPORT_OK;
     if (outErrorMsg) *outErrorMsg = nullptr;
     return TINYEXR_SUCCESS;
 }

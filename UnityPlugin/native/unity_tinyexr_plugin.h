@@ -39,6 +39,36 @@ typedef struct {
     int channelCount;
 } UnityLayerInfo;
 
+// Load compatibility result codes
+typedef enum {
+    UNITY_EXR_SUPPORT_OK = 0,
+    UNITY_EXR_SUPPORT_NOT_EXR = 1,
+    UNITY_EXR_SUPPORT_MULTIPART = 2,
+    UNITY_EXR_SUPPORT_DEEP_IMAGE = 3,
+    UNITY_EXR_SUPPORT_REQUIRES_LAYER = 4,
+    UNITY_EXR_SUPPORT_LAYER_NOT_FOUND = 5,
+    UNITY_EXR_SUPPORT_SPECTRAL = 6,
+    UNITY_EXR_SUPPORT_COMPRESSION = 7,
+    UNITY_EXR_SUPPORT_HEADER_ERROR = 8
+} UnityExrSupportReason;
+
+// Header-based compatibility info (no pixel decode)
+typedef struct {
+    int isSupported;
+    int reason;
+    int isMultipart;
+    int isDeepImage;
+    int isTiled;
+    int isSpectral;
+    int hasLayers;
+    int layerCount;
+    int partCount;
+    int compressionType;
+    int width;
+    int height;
+    int numChannels;
+} UnityExrCompatibilityInfo;
+
 // Core loading functions
 UNITY_TINYEXR_API int UNITY_CALL LoadEXRForUnity(
     const char* filename,
@@ -96,6 +126,13 @@ UNITY_TINYEXR_API void UNITY_CALL FreeErrorMessage(char* errorMsg);
 UNITY_TINYEXR_API int UNITY_CALL GetEXRInfo(
     const char* filename,
     UnityImageInfo* outInfo,
+    char** outErrorMsg
+);
+
+UNITY_TINYEXR_API int UNITY_CALL GetEXRCompatibilityForUnity(
+    const char* filename,
+    const char* layerName,
+    UnityExrCompatibilityInfo* outInfo,
     char** outErrorMsg
 );
 

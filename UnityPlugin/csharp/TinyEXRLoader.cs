@@ -1,14 +1,11 @@
 using System;
-using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using UnityEngine;
 
 namespace TinyEXR
 {
-    /// <summary>
-    /// Unity wrapper for TinyEXR native plugin
-    /// </summary>
-    public static class TinyEXRLoader
+    public static class UTinyEXRLoader
     {
         private const string DLL_NAME = "UnityTinyEXR";
 
@@ -29,12 +26,7 @@ namespace TinyEXR
             public int targetChannels;
             public float gammaCorrection;
 
-            public static ConversionOptions Default => new ConversionOptions
-            {
-                flipY = 1,
-                targetChannels = 4,
-                gammaCorrection = 1.0f
-            };
+            public static ConversionOptions Default => Linear;
 
             public static ConversionOptions Linear => new ConversionOptions
             {
@@ -59,15 +51,82 @@ namespace TinyEXR
             public int channelCount;
         }
 
-        #region DLL Imports
+        /// <summary>
+        /// Reason why an EXR file may not be loadable via LoadEXR().
+        /// </summary>
+        public enum ExrSupportReason
+        {
+            Ok = 0,
+            NotExr = 1,
+            Multipart = 2,
+            DeepImage = 3,
+            RequiresLayer = 4,
+            LayerNotFound = 5,
+            Spectral = 6,
+            Compression = 7,
+            HeaderError = 8
+        }
 
-        [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
-        private static extern int LoadEXRForUnity(
-            [MarshalAs(UnmanagedType.LPStr)] string filename,
-            out IntPtr outData,
-            out ImageInfo outInfo,
-            out IntPtr outErrorMsg
-        );
+        /// <summary>
+        /// Header-based load compatibility (no pixel decode).
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ExrCompatibility
+        {
+            public int isSupported;
+            public int reason;
+            public int isMultipart;
+            public int isDeepImage;
+            public int isTiled;
+            public int isSpectral;
+            public int hasLayers;
+            public int layerCount;
+            public int partCount;
+            public int compressionType;
+            public int width;
+            public int height;
+            public int numChannels;
+
+            public bool IsSupported => isSupported != 0;
+            public ExrSupportReason ReasonCode => (ExrSupportReason)reason;
+            public bool IsMultipart => isMultipart != 0;
+            public bool IsDeepImage => isDeepImage != 0;
+            public bool IsTiled => isTiled != 0;
+            public bool IsSpectral => isSpectral != 0;
+            public bool HasLayers => hasLayers != 0;
+
+            /// <summary>
+            /// Human-readable explanation matching native loader errors.
+            /// </summary>
+            public string GetReasonMessage()
+            {
+                switch (ReasonCode)
+                {
+                    case ExrSupportReason.Ok:
+                        return "EXR is supported by LoadEXR().";
+                    case ExrSupportReason.NotExr:
+                        return "Invalid EXR file.";
+                    case ExrSupportReason.Multipart:
+                        return "Loading multipart or DeepImage is not supported in LoadEXR() API.";
+                    case ExrSupportReason.DeepImage:
+                        return "Loading multipart or DeepImage is not supported in LoadEXR() API.";
+                    case ExrSupportReason.RequiresLayer:
+                        return "EXR contains layered channels; use LoadLayer() with a layer name.";
+                    case ExrSupportReason.LayerNotFound:
+                        return "Layer Not Found.";
+                    case ExrSupportReason.Spectral:
+                        return "Spectral EXR is not supported.";
+                    case ExrSupportReason.Compression:
+                        return "Unsupported EXR compression type.";
+                    case ExrSupportReason.HeaderError:
+                        return "Failed to parse EXR header.";
+                    default:
+                        return "Unknown compatibility issue.";
+                }
+            }
+        }
+
+        #region DLL Imports
 
         [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
         private static extern int LoadEXRWithOptionsForUnity(
@@ -106,6 +165,14 @@ namespace TinyEXR
         );
 
         [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
+        private static extern int GetEXRCompatibilityForUnity(
+            [MarshalAs(UnmanagedType.LPStr)] string filename,
+            [MarshalAs(UnmanagedType.LPStr)] string layerName,
+            out ExrCompatibility outInfo,
+            out IntPtr outErrorMsg
+        );
+
+        [DllImport(DLL_NAME, CallingConvention = CallingConvention.StdCall)]
         private static extern int GetEXRLayerInfo(
             [MarshalAs(UnmanagedType.LPStr)] string filename,
             out IntPtr outLayers,
@@ -136,8 +203,10 @@ namespace TinyEXR
         /// <summary>
         /// Load EXR file with custom options
         /// </summary>
-        public static Texture2D LoadEXRWithOptions(string filePath, ConversionOptions options)
+        private static Texture2D LoadEXRWithOptions(string filePath, ConversionOptions options)
         {
+            ValidateFilePath(filePath);
+
             IntPtr dataPtr = IntPtr.Zero;
             IntPtr errorPtr = IntPtr.Zero;
 
@@ -171,10 +240,23 @@ namespace TinyEXR
         }
 
         /// <summary>
-        /// Load EXR file with resize and custom options (synchronous)
+        /// Load EXR file with resize and custom options (synchronous).
+        /// Must be called from the Unity main thread because it creates a Texture2D.
         /// </summary>
         public static Texture2D LoadEXRWithResize(string filePath, int width, int height, ConversionOptions options)
         {
+            var raw = LoadEXRWithResizeRaw(filePath, width, height, options);
+            return CreateTextureFromRaw(raw, options.gammaCorrection == 1.0f);
+        }
+
+        /// <summary>
+        /// Load and resize EXR into managed pixel bytes. Safe to call from any thread.
+        /// </summary>
+        public static ExrRawImageData LoadEXRWithResizeRaw(string filePath, int width, int height, ConversionOptions options)
+        {
+            ValidateFilePath(filePath);
+            ValidateDimensions(width, height);
+
             IntPtr dataPtr = IntPtr.Zero;
             IntPtr errorPtr = IntPtr.Zero;
 
@@ -189,7 +271,7 @@ namespace TinyEXR
                     throw new Exception($"Failed to load EXR with resize: {errorMsg}");
                 }
 
-                return CreateTexture(dataPtr, info, options.gammaCorrection == 1.0f);
+                return CopyNativeToRaw(dataPtr, info);
             }
             finally
             {
@@ -199,7 +281,68 @@ namespace TinyEXR
         }
 
         /// <summary>
-        /// Load EXR file with resize asynchronously (Unity-friendly)
+        /// Load full-size EXR into managed pixel bytes. Safe to call from any thread.
+        /// </summary>
+        public static ExrRawImageData LoadEXRRaw(string filePath, ConversionOptions options)
+        {
+            ValidateFilePath(filePath);
+
+            IntPtr dataPtr = IntPtr.Zero;
+            IntPtr errorPtr = IntPtr.Zero;
+
+            try
+            {
+                ImageInfo info;
+                int result = LoadEXRWithOptionsForUnity(filePath, out dataPtr, out info, ref options, out errorPtr);
+
+                if (result != 0)
+                {
+                    string errorMsg = GetErrorMessage(errorPtr);
+                    throw new Exception($"Failed to load EXR: {errorMsg}");
+                }
+
+                return CopyNativeToRaw(dataPtr, info);
+            }
+            finally
+            {
+                if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
+                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+            }
+        }
+
+        /// <summary>
+        /// Create a Texture2D from raw EXR pixel data. Must be called on the Unity main thread.
+        /// </summary>
+        public static Texture2D CreateTextureFromRaw(ExrRawImageData raw, bool linear)
+        {
+            if (raw == null)
+                throw new ArgumentNullException(nameof(raw));
+            if (raw.Data == null || raw.Data.Length == 0)
+                throw new ArgumentException("Raw EXR data is empty.", nameof(raw));
+
+            int pixelCount = raw.Width * raw.Height;
+            if (pixelCount <= 0)
+                throw new ArgumentException($"Invalid EXR dimensions: {raw.Width}x{raw.Height}.", nameof(raw));
+
+            ValidateChannelCount(raw.NumChannels);
+
+            int expectedBytes = pixelCount * raw.NumChannels * sizeof(float);
+            if (raw.Data.Length != expectedBytes)
+            {
+                throw new ArgumentException(
+                    $"EXR byte count mismatch: got {raw.Data.Length}, expected {expectedBytes} for " +
+                    $"{raw.Width}x{raw.Height} with {raw.NumChannels} channels.",
+                    nameof(raw));
+            }
+
+            return CreateTextureFromBytes(raw.Data, raw.Width, raw.Height, linear);
+        }
+
+        /// <summary>
+        /// Load EXR file with resize asynchronously (Unity-friendly).
+        /// Intended for callers already on the main thread.
+        /// If the caller runs on a background thread, use LoadEXRWithResizeRaw and CreateTextureFromRaw
+        /// after switching to the main thread instead.
         /// </summary>
         public static async System.Threading.Tasks.Task<Texture2D> LoadEXRAsync(string filePath, int width, int height, bool linear = true)
         {
@@ -208,77 +351,18 @@ namespace TinyEXR
         }
 
         /// <summary>
-        /// Load EXR file with resize and custom options asynchronously (Unity-friendly)
+        /// Load EXR file with resize and custom options asynchronously (Unity-friendly).
+        /// Intended for callers already on the main thread.
+        /// If the caller runs on a background thread, use LoadEXRWithResizeRaw and CreateTextureFromRaw
+        /// after switching to the main thread instead.
         /// </summary>
         public static async System.Threading.Tasks.Task<Texture2D> LoadEXRWithResizeAsync(string filePath, int width, int height, ConversionOptions options)
         {
-            // Run the heavy loading operation on a background thread
-            var loadTask = System.Threading.Tasks.Task.Run(() =>
-            {
-                IntPtr dataPtr = IntPtr.Zero;
-                IntPtr errorPtr = IntPtr.Zero;
+            // Decode and resize on a worker thread; resume on the caller context so texture upload stays on main thread.
+            var raw = await System.Threading.Tasks.Task.Run(() =>
+                LoadEXRWithResizeRaw(filePath, width, height, options)).ConfigureAwait(true);
 
-                try
-                {
-                    ImageInfo info;
-                    int result = LoadEXRWithResizeForUnity(filePath, width, height, out dataPtr, out info, ref options, out errorPtr);
-
-                    if (result != 0)
-                    {
-                        string errorMsg = GetErrorMessage(errorPtr);
-                        throw new Exception($"Failed to load EXR with resize: {errorMsg}");
-                    }
-
-                    // Copy data to managed array before freeing native memory
-                    int pixelCount = info.width * info.height * info.numChannels;
-                    float[] pixels = new float[pixelCount];
-                    Marshal.Copy(dataPtr, pixels, 0, pixelCount);
-
-                    return (pixels, info, options.gammaCorrection == 1.0f);
-                }
-                finally
-                {
-                    if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
-                    if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
-                }
-            });
-
-            var (pixels, info, linear) = await loadTask;
-
-            // Create texture on main thread (Unity requirement)
-            Texture2D texture = new Texture2D(info.width, info.height, TextureFormat.RGBAFloat, false, linear);
-
-            Color[] colors = new Color[info.width * info.height];
-            for (int i = 0; i < colors.Length; i++)
-            {
-                int idx = i * info.numChannels;
-                switch (info.numChannels)
-                {
-                    case 1:
-                    {
-                        float l = pixels[idx + 0];
-                        colors[i] = new Color(l, l, l, 1.0f);
-                        break;
-                    }
-                    case 2:
-                    {
-                        float l = pixels[idx + 0];
-                        float a = pixels[idx + 1];
-                        colors[i] = new Color(l, l, l, a);
-                        break;
-                    }
-                    case 3:
-                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], 1.0f);
-                        break;
-                    case 4:
-                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
-                        break;
-                }
-            }
-            texture.SetPixels(colors);
-            texture.Apply();
-
-            return texture;
+            return CreateTextureFromRaw(raw, options.gammaCorrection == 1.0f);
         }
 
         /// <summary>
@@ -286,6 +370,10 @@ namespace TinyEXR
         /// </summary>
         public static Texture2D LoadLayer(string filePath, string layerName, bool linear = true)
         {
+            ValidateFilePath(filePath);
+            if (string.IsNullOrWhiteSpace(layerName))
+                throw new ArgumentException("Layer name cannot be null or empty.", nameof(layerName));
+
             IntPtr dataPtr = IntPtr.Zero;
             IntPtr errorPtr = IntPtr.Zero;
 
@@ -310,10 +398,49 @@ namespace TinyEXR
         }
 
         /// <summary>
+        /// Check whether LoadEXR() can load this file (header pre-flight, no pixel decode).
+        /// </summary>
+        public static bool IsLoadSupported(string filePath)
+        {
+            return GetCompatibility(filePath).IsSupported;
+        }
+
+        /// <summary>
+        /// Check load compatibility for LoadEXR() without decoding pixels.
+        /// </summary>
+        public static ExrCompatibility GetCompatibility(string filePath)
+        {
+            return GetCompatibility(filePath, null);
+        }
+
+        /// <summary>
+        /// Check load compatibility for LoadEXR() or LoadLayer(layerName).
+        /// </summary>
+        public static ExrCompatibility GetCompatibility(string filePath, string layerName)
+        {
+            ValidateFilePath(filePath);
+
+            IntPtr errorPtr = IntPtr.Zero;
+
+            try
+            {
+                ExrCompatibility compat;
+                GetEXRCompatibilityForUnity(filePath, layerName, out compat, out errorPtr);
+                return compat;
+            }
+            finally
+            {
+                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+            }
+        }
+
+        /// <summary>
         /// Get EXR file information without loading pixels
         /// </summary>
         public static ImageInfo GetInfo(string filePath)
         {
+            ValidateFilePath(filePath);
+
             IntPtr errorPtr = IntPtr.Zero;
 
             try
@@ -349,6 +476,8 @@ namespace TinyEXR
         /// </summary>
         public static LayerInfo[] GetLayers(string filePath)
         {
+            ValidateFilePath(filePath);
+
             IntPtr layersPtr = IntPtr.Zero;
             IntPtr errorPtr = IntPtr.Zero;
 
@@ -386,48 +515,71 @@ namespace TinyEXR
 
         #region Helper Methods
 
+        private static void ValidateFilePath(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("File path cannot be null or empty.", nameof(filePath));
+
+            if (!File.Exists(filePath))
+                throw new FileNotFoundException($"File does not exist: {filePath}", filePath);
+        }
+
+        private static void ValidateDimensions(int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+                throw new ArgumentOutOfRangeException(nameof(width),
+                    $"Invalid resize dimensions: {width}x{height}.");
+        }
+
+        private static ExrRawImageData CopyNativeToRaw(IntPtr dataPtr, ImageInfo info)
+        {
+            ValidateChannelCount(info.numChannels);
+
+            int byteCount = info.width * info.height * info.numChannels * sizeof(float);
+            var data = new byte[byteCount];
+            Marshal.Copy(dataPtr, data, 0, byteCount);
+
+            return new ExrRawImageData
+            {
+                Width = info.width,
+                Height = info.height,
+                NumChannels = info.numChannels,
+                Data = data
+            };
+        }
+
+        private static void ValidateChannelCount(int numChannels)
+        {
+            if (numChannels < 1 || numChannels > 4)
+                throw new NotSupportedException($"Unsupported EXR channel count: {numChannels}. Expected 1-4 channels.");
+        }
+
         private static Texture2D CreateTexture(IntPtr dataPtr, ImageInfo info, bool linear)
         {
-            if (info.numChannels < 1 || info.numChannels > 4)
-                throw new NotSupportedException($"Unsupported EXR channel count: {info.numChannels}. Expected 1-4 channels.");
+            ValidateChannelCount(info.numChannels);
+            return CreateTextureFromBytes(
+                dataPtr,
+                info.width * info.height * info.numChannels * sizeof(float),
+                info.width,
+                info.height,
+                info.numChannels,
+                linear);
+        }
 
-            Texture2D texture = new Texture2D(info.width, info.height, TextureFormat.RGBAFloat, false, linear);
-
-            int pixelCount = info.width * info.height * info.numChannels;
-            float[] pixels = new float[pixelCount];
-            Marshal.Copy(dataPtr, pixels, 0, pixelCount);
-
-            Color[] colors = new Color[info.width * info.height];
-            for (int i = 0; i < colors.Length; i++)
-            {
-                int idx = i * info.numChannels;
-                switch (info.numChannels)
-                {
-                    case 1:
-                        {
-                            float l = pixels[idx + 0];
-                            colors[i] = new Color(l, l, l, 1.0f);
-                            break;
-                        }
-                    case 2:
-                        {
-                            float l = pixels[idx + 0];
-                            float a = pixels[idx + 1];
-                            colors[i] = new Color(l, l, l, a);
-                            break;
-                        }
-                    case 3:
-                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], 1.0f);
-                        break;
-                    case 4:
-                        colors[i] = new Color(pixels[idx + 0], pixels[idx + 1], pixels[idx + 2], pixels[idx + 3]);
-                        break;
-                }
-            }
-
-            texture.SetPixels(colors);
+        private static Texture2D CreateTextureFromBytes(byte[] data, int width, int height, bool linear)
+        {
+            var texture = new Texture2D(width, height, TextureFormat.RGBAFloat, false, linear);
+            texture.LoadRawTextureData(data);
             texture.Apply();
+            return texture;
+        }
 
+        private static Texture2D CreateTextureFromBytes(
+            IntPtr dataPtr, int byteCount, int width, int height, int numChannels, bool linear)
+        {
+            var texture = new Texture2D(width, height, TextureFormat.RGBAFloat, false, linear);
+            texture.LoadRawTextureData(dataPtr, byteCount);
+            texture.Apply();
             return texture;
         }
 
