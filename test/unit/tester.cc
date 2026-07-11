@@ -34,6 +34,10 @@ std::string GetPath(const char* basename) {
   return s;
 }
 
+std::string GetRepoPath(const char* basename) {
+  return std::string("../../") + std::string(basename);
+}
+
 // simply dumping to build folder
 std::string GetDumpPath(const char* basename) {
   std::string s = basename;
@@ -3351,5 +3355,296 @@ TEST_CASE("B44A: Flat block compression", "[B44A]") {
   free(data);
   FreeEXRImage(&image2);
   FreeEXRHeader(&header2);
+  FreeEXRHeader(&header);
+}
+
+// =============================================================================
+// Luminance/Chroma (Y/RY/BY) Tests
+// =============================================================================
+
+static void RgbToYca(float r, float g, float b, const float yw[3], float *outY,
+                     float *outRy, float *outBy) {
+  if (r == g && g == b) {
+    *outY = g;
+    *outRy = 0.0f;
+    *outBy = 0.0f;
+    return;
+  }
+  const float Y = r * yw[0] + g * yw[1] + b * yw[2];
+  *outY = Y;
+  if (Y != 0.0f && std::fabs(r - Y) < 65504.0f * Y) {
+    *outRy = (r - Y) / Y;
+  } else {
+    *outRy = 0.0f;
+  }
+  if (Y != 0.0f && std::fabs(b - Y) < 65504.0f * Y) {
+    *outBy = (b - Y) / Y;
+  } else {
+    *outBy = 0.0f;
+  }
+}
+
+TEST_CASE("YC: LoadEXR round-trip full-res Y/RY/BY", "[YC]") {
+  const int width = 64;
+  const int height = 64;
+  const int num_channels = 3;
+  const float yw[3] = {0.2126f, 0.7152f, 0.0722f};
+
+  std::vector<float> original_r(width * height);
+  std::vector<float> original_g(width * height);
+  std::vector<float> original_b(width * height);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      const int idx = y * width + x;
+      original_r[idx] = static_cast<float>(x) / static_cast<float>(width);
+      original_g[idx] = static_cast<float>(y) / static_cast<float>(height);
+      original_b[idx] = 0.25f + 0.5f * static_cast<float>(x + y) /
+                                       static_cast<float>(width + height);
+    }
+  }
+
+  std::vector<float> ch_y(width * height, 0.0f);
+  std::vector<float> ch_ry(width * height, 0.0f);
+  std::vector<float> ch_by(width * height, 0.0f);
+
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      const int idx = y * width + x;
+      float Y, RY, BY;
+      RgbToYca(original_r[idx], original_g[idx], original_b[idx], yw, &Y, &RY,
+               &BY);
+      ch_y[idx] = Y;
+      ch_ry[idx] = RY;
+      ch_by[idx] = BY;
+    }
+  }
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo *>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int *>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types =
+      static_cast<int *>(malloc(sizeof(int) * num_channels));
+
+  strncpy(header.channels[0].name, "BY", 255);
+  strncpy(header.channels[1].name, "RY", 255);
+  strncpy(header.channels[2].name, "Y", 255);
+
+  for (int i = 0; i < num_channels; i++) {
+    header.channels[i].x_sampling = 1;
+    header.channels[i].y_sampling = 1;
+    header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+    header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_HALF;
+  }
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_NONE;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  float *channel_ptrs[3] = {ch_by.data(), ch_ry.data(), ch_y.data()};
+  image.images = reinterpret_cast<unsigned char **>(channel_ptrs);
+
+  unsigned char *data = nullptr;
+  const char *err = nullptr;
+  const size_t data_size =
+      SaveEXRImageToMemory(&image, &header, &data, &err);
+  REQUIRE(data_size > 0);
+  REQUIRE(data != nullptr);
+
+  float *loaded = nullptr;
+  int loaded_w = 0;
+  int loaded_h = 0;
+  const int ret = LoadEXRFromMemory(&loaded, &loaded_w, &loaded_h, data,
+                                    data_size, &err);
+  if (ret != TINYEXR_SUCCESS && err) {
+    INFO("YC load error: " << err);
+  }
+  REQUIRE(ret == TINYEXR_SUCCESS);
+  REQUIRE(loaded_w == width);
+  REQUIRE(loaded_h == height);
+
+  int errors = 0;
+  const float tolerance = 0.01f;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      const int idx = y * width + x;
+      const float dr = std::fabs(loaded[idx * 4 + 0] - original_r[idx]);
+      const float dg = std::fabs(loaded[idx * 4 + 1] - original_g[idx]);
+      const float db = std::fabs(loaded[idx * 4 + 2] - original_b[idx]);
+      if (dr > tolerance || dg > tolerance || db > tolerance) {
+        errors++;
+      }
+    }
+  }
+
+  INFO("YC round-trip pixel errors: " << errors << "/" << (width * height));
+  REQUIRE(errors <= 8);
+
+  free(loaded);
+  free(data);
+  FreeEXRHeader(&header);
+}
+
+static int CompareYcToRgbReference(const char *rgb_path, const char *yc_path,
+                                   float tolerance) {
+  float *rgb_ref = nullptr;
+  float *yc_loaded = nullptr;
+  int ref_w = 0;
+  int ref_h = 0;
+  int yc_w = 0;
+  int yc_h = 0;
+  const char *err = nullptr;
+
+  int ret = LoadEXR(&rgb_ref, &ref_w, &ref_h, rgb_path, &err);
+  if (ret != TINYEXR_SUCCESS) {
+    if (rgb_ref) {
+      free(rgb_ref);
+    }
+    return -1;
+  }
+
+  err = nullptr;
+  ret = LoadEXR(&yc_loaded, &yc_w, &yc_h, yc_path, &err);
+  if (ret != TINYEXR_SUCCESS) {
+    free(rgb_ref);
+    if (yc_loaded) {
+      free(yc_loaded);
+    }
+    return -1;
+  }
+
+  if (ref_w != yc_w || ref_h != yc_h) {
+    free(rgb_ref);
+    free(yc_loaded);
+    return -1;
+  }
+
+  int errors = 0;
+  const int pixel_count = ref_w * ref_h;
+  for (int i = 0; i < pixel_count; i++) {
+    const float dr = std::fabs(yc_loaded[i * 4 + 0] - rgb_ref[i * 4 + 0]);
+    const float dg = std::fabs(yc_loaded[i * 4 + 1] - rgb_ref[i * 4 + 1]);
+    const float db = std::fabs(yc_loaded[i * 4 + 2] - rgb_ref[i * 4 + 2]);
+    if (dr > tolerance || dg > tolerance || db > tolerance) {
+      errors++;
+    }
+  }
+
+  free(rgb_ref);
+  free(yc_loaded);
+  return errors;
+}
+
+TEST_CASE("YC: Chromaticities fixtures match RGB reference", "[YC]") {
+  const float tolerance = 0.05f;
+
+  struct YcFixture {
+    const char *rgb;
+    const char *yc;
+  };
+
+  const YcFixture fixtures[] = {
+      {"Chromaticities/Rec709.exr", "Chromaticities/Rec709_YC.exr"},
+      {"Chromaticities/XYZ.exr", "Chromaticities/XYZ_YC.exr"},
+  };
+
+  for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+    const std::string rgb_path = GetRepoPath(fixtures[i].rgb);
+    const std::string yc_path = GetRepoPath(fixtures[i].yc);
+    INFO("Comparing " << yc_path << " against " << rgb_path);
+    const int errors = CompareYcToRgbReference(rgb_path.c_str(), yc_path.c_str(),
+                                               tolerance);
+    REQUIRE(errors >= 0);
+
+    float *probe = nullptr;
+    int pw = 0;
+    int ph = 0;
+    const char *err = nullptr;
+    REQUIRE(LoadEXR(&probe, &pw, &ph, rgb_path.c_str(), &err) == TINYEXR_SUCCESS);
+    const int total = pw * ph;
+    const int max_errors = total / 20;
+    free(probe);
+
+    INFO("YC vs RGB pixel errors: " << errors << " / max " << max_errors);
+    REQUIRE(errors <= max_errors);
+  }
+}
+
+TEST_CASE("YC: grayscale Y-only expands to RGB", "[YC]") {
+  const int width = 32;
+  const int height = 32;
+  const int num_channels = 3;
+
+  std::vector<float> ch_y(width * height);
+  std::vector<float> ch_ry(width * height, 0.0f);
+  std::vector<float> ch_by(width * height, 0.0f);
+
+  for (int i = 0; i < width * height; i++) {
+    ch_y[i] = static_cast<float>(i) / static_cast<float>(width * height);
+  }
+
+  EXRHeader header;
+  InitEXRHeader(&header);
+  header.num_channels = num_channels;
+  header.channels = static_cast<EXRChannelInfo *>(
+      malloc(sizeof(EXRChannelInfo) * num_channels));
+  header.pixel_types = static_cast<int *>(malloc(sizeof(int) * num_channels));
+  header.requested_pixel_types =
+      static_cast<int *>(malloc(sizeof(int) * num_channels));
+
+  strncpy(header.channels[0].name, "BY", 255);
+  strncpy(header.channels[1].name, "RY", 255);
+  strncpy(header.channels[2].name, "Y", 255);
+
+  header.channels[0].x_sampling = 2;
+  header.channels[0].y_sampling = 2;
+  header.channels[1].x_sampling = 2;
+  header.channels[1].y_sampling = 2;
+  header.channels[2].x_sampling = 1;
+  header.channels[2].y_sampling = 1;
+
+  for (int i = 0; i < num_channels; i++) {
+    header.pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+    header.requested_pixel_types[i] = TINYEXR_PIXELTYPE_HALF;
+  }
+  header.compression_type = TINYEXR_COMPRESSIONTYPE_NONE;
+
+  EXRImage image;
+  InitEXRImage(&image);
+  image.num_channels = num_channels;
+  image.width = width;
+  image.height = height;
+
+  float *channel_ptrs[3] = {ch_by.data(), ch_ry.data(), ch_y.data()};
+  image.images = reinterpret_cast<unsigned char **>(channel_ptrs);
+
+  unsigned char *data = nullptr;
+  const char *err = nullptr;
+  const size_t data_size =
+      SaveEXRImageToMemory(&image, &header, &data, &err);
+  REQUIRE(data_size > 0);
+
+  float *loaded = nullptr;
+  int loaded_w = 0;
+  int loaded_h = 0;
+  const int ret = LoadEXRFromMemory(&loaded, &loaded_w, &loaded_h, data,
+                                    data_size, &err);
+  REQUIRE(ret == TINYEXR_SUCCESS);
+
+  for (int i = 0; i < width * height; i++) {
+    const float y = ch_y[i];
+    REQUIRE(std::fabs(loaded[i * 4 + 0] - y) < 0.001f);
+    REQUIRE(std::fabs(loaded[i * 4 + 1] - y) < 0.001f);
+    REQUIRE(std::fabs(loaded[i * 4 + 2] - y) < 0.001f);
+  }
+
+  free(loaded);
+  free(data);
   FreeEXRHeader(&header);
 }

@@ -3348,12 +3348,60 @@ static bool CompressPiz(unsigned char *outPtr, unsigned int *outSize,
   return true;
 }
 
+static size_t ComputePizWaveletBufferSize(int data_width, int num_lines,
+                                          int num_channels,
+                                          const EXRChannelInfo *channels) {
+  size_t total = 0;
+  for (int c = 0; c < num_channels; c++) {
+    const int xs =
+        channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+    const int ys =
+        channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+    const int nx = (data_width + xs - 1) / xs;
+    const int ny = (num_lines + ys - 1) / ys;
+    size_t pixelSize = sizeof(int);
+    if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
+      pixelSize = sizeof(short);
+    }
+    total += static_cast<size_t>(nx) * static_cast<size_t>(ny) *
+             (pixelSize / sizeof(unsigned short));
+  }
+  return total * sizeof(unsigned short);
+}
+
+static size_t ComputePizOutputSize(int data_width, int num_lines,
+                                   int num_channels,
+                                   const EXRChannelInfo *channels) {
+  size_t total = 0;
+  for (int y = 0; y < num_lines; y++) {
+    for (int c = 0; c < num_channels; c++) {
+      const int xs =
+          channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+      const int ys =
+          channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+      if ((y % ys) != 0) {
+        continue;
+      }
+      const int nx = (data_width + xs - 1) / xs;
+      size_t bytes = 2;
+      if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT ||
+          channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
+        bytes = 4;
+      }
+      total += static_cast<size_t>(nx) * bytes;
+    }
+  }
+  return total;
+}
+
 static bool DecompressPiz(unsigned char *outPtr, const unsigned char *inPtr,
                           size_t tmpBufSizeInBytes, size_t inLen, int num_channels,
                           const EXRChannelInfo *channels, int data_width,
                           int num_lines) {
-  if (inLen == tmpBufSizeInBytes) {
-    // Data is not compressed(Issue 40).
+  const size_t expectedOutSize =
+      ComputePizOutputSize(data_width, num_lines, num_channels, channels);
+  if (inLen == expectedOutSize) {
+    // Uncompressed scanline block with subsampled channel layout.
     memcpy(outPtr, inPtr, inLen);
     return true;
   }
@@ -3434,7 +3482,10 @@ static bool DecompressPiz(unsigned char *outPtr, const unsigned char *inPtr,
     return false;
   }
 
-  std::vector<unsigned short> tmpBuffer(tmpBufSizeInBytes / sizeof(unsigned short));
+  const size_t waveletShortCount =
+      ComputePizWaveletBufferSize(data_width, num_lines, num_channels, channels) /
+      sizeof(unsigned short);
+  std::vector<unsigned short> tmpBuffer(waveletShortCount);
   hufUncompress(reinterpret_cast<const char *>(ptr), length, &tmpBuffer);
 
   //
@@ -3447,6 +3498,8 @@ static bool DecompressPiz(unsigned char *outPtr, const unsigned char *inPtr,
 
   for (size_t i = 0; i < static_cast<size_t>(num_channels); ++i) {
     const EXRChannelInfo &chan = channels[i];
+    const int xs = chan.x_sampling > 0 ? chan.x_sampling : 1;
+    const int ys = chan.y_sampling > 0 ? chan.y_sampling : 1;
 
     size_t pixelSize = sizeof(int);  // UINT and FLOAT
     if (chan.pixel_type == TINYEXR_PIXELTYPE_HALF) {
@@ -3455,9 +3508,8 @@ static bool DecompressPiz(unsigned char *outPtr, const unsigned char *inPtr,
 
     channelData[i].start = tmpBufferEnd;
     channelData[i].end = channelData[i].start;
-    channelData[i].nx = data_width;
-    channelData[i].ny = num_lines;
-    // channelData[i].ys = 1;
+    channelData[i].nx = (data_width + xs - 1) / xs;
+    channelData[i].ny = (num_lines + ys - 1) / ys;
     channelData[i].size = static_cast<int>(pixelSize / sizeof(short));
 
     tmpBufferEnd += channelData[i].nx * channelData[i].ny * channelData[i].size;
@@ -3476,19 +3528,24 @@ static bool DecompressPiz(unsigned char *outPtr, const unsigned char *inPtr,
   // Expand the pixel data to their original range
   //
 
-  applyLut(lut.data(), &tmpBuffer.at(0), static_cast<int>(tmpBufSizeInBytes / sizeof(unsigned short)));
+  applyLut(lut.data(), &tmpBuffer.at(0),
+           static_cast<int>(waveletShortCount));
 
   for (int y = 0; y < num_lines; y++) {
     for (size_t i = 0; i < channelData.size(); ++i) {
       PIZChannelData &cd = channelData[i];
+      const int ys =
+          channels[i].y_sampling > 0 ? channels[i].y_sampling : 1;
+      if ((y % ys) != 0) {
+        continue;
+      }
 
-      // if (modp (y, cd.ys) != 0)
-      //    continue;
-
+      const int lineInChannel = y / ys;
       size_t n = static_cast<size_t>(cd.nx * cd.size);
-      memcpy(outPtr, cd.end, static_cast<size_t>(n * sizeof(unsigned short)));
+      unsigned short *src =
+          cd.start + static_cast<size_t>(lineInChannel * cd.nx * cd.size);
+      memcpy(outPtr, src, static_cast<size_t>(n * sizeof(unsigned short)));
       outPtr += n * sizeof(unsigned short);
-      cd.end += n;
     }
   }
 
@@ -4862,9 +4919,11 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
       return false;
     }
 
-    // Allocate original data size.
-    std::vector<unsigned char> outBuf(static_cast<size_t>(
-        static_cast<size_t>(width * num_lines) * pixel_data_size));
+    // Allocate decompressed size (accounts for subsampled channels).
+    const size_t outBufSize =
+        ComputePizOutputSize(width, num_lines, static_cast<int>(num_channels),
+                             channels);
+    std::vector<unsigned char> outBuf(outBufSize);
     size_t tmpBufLen = outBuf.size();
 
     bool ret = tinyexr::DecompressPiz(
@@ -4875,124 +4934,118 @@ static bool DecodePixelData(/* out */ unsigned char **out_images,
       return false;
     }
 
-    // For PIZ_COMPRESSION:
-    //   pixel sample data for channel 0 for scanline 0
-    //   pixel sample data for channel 1 for scanline 0
-    //   pixel sample data for channel ... for scanline 0
-    //   pixel sample data for channel n for scanline 0
-    //   pixel sample data for channel 0 for scanline 1
-    //   pixel sample data for channel 1 for scanline 1
-    //   pixel sample data for channel ... for scanline 1
-    //   pixel sample data for channel n for scanline 1
-    //   ...
-    for (size_t c = 0; c < static_cast<size_t>(num_channels); c++) {
-      if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
-          const unsigned short *line_ptr = reinterpret_cast<unsigned short *>(
-              &outBuf.at(v * pixel_data_size * static_cast<size_t>(width) +
-                         channel_offset_list[c] * static_cast<size_t>(width)));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+    // Walk decompressed data in OpenEXR scanline order (per line, per channel).
+    size_t bufOffset = 0;
+    for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
+      const int globalY = line_no + static_cast<int>(v);
+      for (size_t c = 0; c < static_cast<size_t>(num_channels); c++) {
+        const int xs =
+            channels[c].x_sampling > 0 ? channels[c].x_sampling : 1;
+        const int ys =
+            channels[c].y_sampling > 0 ? channels[c].y_sampling : 1;
+        if ((globalY % ys) != 0) {
+          continue;
+        }
+        const int ch_width = (width + xs - 1) / xs;
+
+        if (channels[c].pixel_type == TINYEXR_PIXELTYPE_HALF) {
+          for (int u = 0; u < ch_width; u++) {
+            if (bufOffset + 1 > outBuf.size()) {
+              return false;
+            }
             FP16 hf;
-
-            // hf.u = line_ptr[u];
-            // use `cpy` to avoid unaligned memory access when compiler's
-            // optimization is on.
-            tinyexr::cpy2(&(hf.u), line_ptr + u);
-
+            tinyexr::cpy2(&(hf.u),
+                          reinterpret_cast<const unsigned short *>(
+                              &outBuf.at(bufOffset)));
+            bufOffset += 2;
             tinyexr::swap2(reinterpret_cast<unsigned short *>(&hf.u));
 
             if (requested_pixel_types[c] == TINYEXR_PIXELTYPE_HALF) {
               unsigned short *image =
                   reinterpret_cast<unsigned short **>(out_images)[c];
               if (line_order == 0) {
-                image += (static_cast<size_t>(line_no) + v) *
+                image += static_cast<size_t>(globalY) *
                              static_cast<size_t>(x_stride) +
-                         u;
+                         static_cast<size_t>(u);
               } else {
                 image += static_cast<size_t>(
-                             (height - 1 - (line_no + static_cast<int>(v)))) *
+                             height - 1 - globalY) *
                              static_cast<size_t>(x_stride) +
-                         u;
+                         static_cast<size_t>(u);
               }
               *image = hf.u;
-            } else {  // HALF -> FLOAT
+            } else {
               FP32 f32 = half_to_float(hf);
               float *image = reinterpret_cast<float **>(out_images)[c];
-              size_t offset = 0;
               if (line_order == 0) {
-                offset = (static_cast<size_t>(line_no) + v) *
+                image += static_cast<size_t>(globalY) *
                              static_cast<size_t>(x_stride) +
-                         u;
+                         static_cast<size_t>(u);
               } else {
-                offset = static_cast<size_t>(
-                             (height - 1 - (line_no + static_cast<int>(v)))) *
+                image += static_cast<size_t>(
+                             height - 1 - globalY) *
                              static_cast<size_t>(x_stride) +
-                         u;
+                         static_cast<size_t>(u);
               }
-              image += offset;
               *image = f32.f;
             }
           }
-        }
-      } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT) {
-        TINYEXR_CHECK_AND_RETURN_C(requested_pixel_types[c] == TINYEXR_PIXELTYPE_UINT, false);
-
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
-          const unsigned int *line_ptr = reinterpret_cast<unsigned int *>(
-              &outBuf.at(v * pixel_data_size * static_cast<size_t>(width) +
-                         channel_offset_list[c] * static_cast<size_t>(width)));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+        } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_UINT) {
+          TINYEXR_CHECK_AND_RETURN_C(
+              requested_pixel_types[c] == TINYEXR_PIXELTYPE_UINT, false);
+          for (int u = 0; u < ch_width; u++) {
+            if (bufOffset + 3 > outBuf.size()) {
+              return false;
+            }
             unsigned int val;
-            // val = line_ptr[u];
-            tinyexr::cpy4(&val, line_ptr + u);
-
+            tinyexr::cpy4(&val, reinterpret_cast<const unsigned int *>(
+                                    &outBuf.at(bufOffset)));
+            bufOffset += 4;
             tinyexr::swap4(&val);
-
             unsigned int *image =
                 reinterpret_cast<unsigned int **>(out_images)[c];
             if (line_order == 0) {
-              image += (static_cast<size_t>(line_no) + v) *
+              image += static_cast<size_t>(globalY) *
                            static_cast<size_t>(x_stride) +
-                       u;
+                       static_cast<size_t>(u);
             } else {
-              image += static_cast<size_t>(
-                           (height - 1 - (line_no + static_cast<int>(v)))) *
+              image += static_cast<size_t>(height - 1 - globalY) *
                            static_cast<size_t>(x_stride) +
-                       u;
+                       static_cast<size_t>(u);
             }
             *image = val;
           }
-        }
-      } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
-        TINYEXR_CHECK_AND_RETURN_C(requested_pixel_types[c] == TINYEXR_PIXELTYPE_FLOAT, false);
-        for (size_t v = 0; v < static_cast<size_t>(num_lines); v++) {
-          const float *line_ptr = reinterpret_cast<float *>(&outBuf.at(
-              v * pixel_data_size * static_cast<size_t>(width) +
-              channel_offset_list[c] * static_cast<size_t>(width)));
-          for (size_t u = 0; u < static_cast<size_t>(width); u++) {
+        } else if (channels[c].pixel_type == TINYEXR_PIXELTYPE_FLOAT) {
+          TINYEXR_CHECK_AND_RETURN_C(
+              requested_pixel_types[c] == TINYEXR_PIXELTYPE_FLOAT, false);
+          for (int u = 0; u < ch_width; u++) {
+            if (bufOffset + 3 > outBuf.size()) {
+              return false;
+            }
             float val;
-            // val = line_ptr[u];
-            tinyexr::cpy4(&val, line_ptr + u);
-
+            tinyexr::cpy4(&val,
+                          reinterpret_cast<const float *>(&outBuf.at(bufOffset)));
+            bufOffset += 4;
             tinyexr::swap4(reinterpret_cast<unsigned int *>(&val));
-
             float *image = reinterpret_cast<float **>(out_images)[c];
             if (line_order == 0) {
-              image += (static_cast<size_t>(line_no) + v) *
+              image += static_cast<size_t>(globalY) *
                            static_cast<size_t>(x_stride) +
-                       u;
+                       static_cast<size_t>(u);
             } else {
-              image += static_cast<size_t>(
-                           (height - 1 - (line_no + static_cast<int>(v)))) *
+              image += static_cast<size_t>(height - 1 - globalY) *
                            static_cast<size_t>(x_stride) +
-                       u;
+                       static_cast<size_t>(u);
             }
             *image = val;
           }
+        } else {
+          return false;
         }
-      } else {
-        return false;
       }
+    }
+    if (bufOffset != outBuf.size()) {
+      return false;
     }
 #else
     return false;
@@ -7659,6 +7712,520 @@ static void ChannelsInLayer(const EXRHeader &exr_header,
   }
 }
 
+// ---------------------------------------------------------------------------
+// Luminance/chroma (Y/RY/BY) to RGBA conversion (OpenEXR ImfRgbaYca)
+// ---------------------------------------------------------------------------
+
+static const int kYcaFilterN = 27;
+static const int kYcaFilterN2 = 13;
+
+struct YcaPixel {
+  float r;  // RY chroma
+  float g;  // Y luminance
+  float b;  // BY chroma
+  float a;
+};
+
+struct Chromaticities {
+  float red_x, red_y;
+  float green_x, green_y;
+  float blue_x, blue_y;
+  float white_x, white_y;
+};
+
+static Chromaticities GetRec709Chromaticities() {
+  Chromaticities cr;
+  cr.red_x = 0.640f;
+  cr.red_y = 0.330f;
+  cr.green_x = 0.300f;
+  cr.green_y = 0.600f;
+  cr.blue_x = 0.150f;
+  cr.blue_y = 0.060f;
+  cr.white_x = 0.3127f;
+  cr.white_y = 0.3290f;
+  return cr;
+}
+
+static Chromaticities GetChromaticities(const EXRHeader &exr_header) {
+  // Default to Rec.709 when the attribute is missing (OpenEXR spec).
+  Chromaticities cr = GetRec709Chromaticities();
+  for (int i = 0; i < exr_header.num_custom_attributes; i++) {
+    const EXRAttribute &attr = exr_header.custom_attributes[i];
+    if (strcmp(attr.name, "chromaticities") == 0 && attr.size >= 32 &&
+        attr.value != NULL) {
+      const float *v = reinterpret_cast<const float *>(attr.value);
+      cr.red_x = v[0];
+      cr.red_y = v[1];
+      cr.green_x = v[2];
+      cr.green_y = v[3];
+      cr.blue_x = v[4];
+      cr.blue_y = v[5];
+      cr.white_x = v[6];
+      cr.white_y = v[7];
+      break;
+    }
+  }
+  return cr;
+}
+
+static void ComputeYw(const Chromaticities &chroma, float yw[3]) {
+  // Port of OpenEXR RGBtoXYZ + computeYw (ImfChromaticities / ImfRgbaYca).
+  const float Y = 1.0f;
+  float white_y = chroma.white_y;
+  if (white_y == 0.0f) {
+    white_y = 1.0f;
+  }
+  const float X = chroma.white_x * Y / white_y;
+  const float Z = (1.0f - chroma.white_x - chroma.white_y) * Y / white_y;
+
+  const float d = chroma.red_x * (chroma.blue_y - chroma.green_y) +
+                  chroma.blue_x * (chroma.green_y - chroma.red_y) +
+                  chroma.green_x * (chroma.red_y - chroma.blue_y);
+
+  if (d == 0.0f) {
+    yw[0] = 0.2126f;
+    yw[1] = 0.7152f;
+    yw[2] = 0.0722f;
+    return;
+  }
+
+  const float SrN =
+      (X * (chroma.blue_y - chroma.green_y) -
+       chroma.green_x * (Y * (chroma.blue_y - 1.0f) + chroma.blue_y * (X + Z)) +
+       chroma.blue_x * (Y * (chroma.green_y - 1.0f) + chroma.green_y * (X + Z)));
+  const float SgN =
+      (X * (chroma.red_y - chroma.blue_y) +
+       chroma.red_x * (Y * (chroma.blue_y - 1.0f) + chroma.blue_y * (X + Z)) -
+       chroma.blue_x * (Y * (chroma.red_y - 1.0f) + chroma.red_y * (X + Z)));
+  const float SbN =
+      (X * (chroma.green_y - chroma.red_y) -
+       chroma.red_x * (Y * (chroma.green_y - 1.0f) + chroma.green_y * (X + Z)) +
+       chroma.green_x * (Y * (chroma.red_y - 1.0f) + chroma.red_y * (X + Z)));
+
+  const float Sr = SrN / d;
+  const float Sg = SgN / d;
+  const float Sb = SbN / d;
+
+  const float m0 = Sr * chroma.red_x;
+  const float m1 = Sg * chroma.green_x;
+  const float m2 = Sb * chroma.blue_x;
+  const float m3 = Sr * chroma.red_y;
+  const float m4 = Sg * chroma.green_y;
+  const float m5 = Sb * chroma.blue_y;
+
+  const float sum = m3 + m4 + m5;
+  if (sum == 0.0f) {
+    yw[0] = 0.2126f;
+    yw[1] = 0.7152f;
+    yw[2] = 0.0722f;
+    return;
+  }
+  yw[0] = m3 / sum;
+  yw[1] = m4 / sum;
+  yw[2] = m5 / sum;
+}
+
+static void YCAtoRGBA(const float yw[3], float yVal, float ry, float by,
+                      float *outR, float *outG, float *outB) {
+  // Port of OpenEXR RgbaYca::YCAtoRGBA.
+  if (ry == 0.0f && by == 0.0f) {
+    *outR = yVal;
+    *outG = yVal;
+    *outB = yVal;
+    return;
+  }
+  const float Y = yVal;
+  const float r = (ry + 1.0f) * Y;
+  const float b = (by + 1.0f) * Y;
+  const float g = (yw[1] != 0.0f) ? (Y - r * yw[0] - b * yw[2]) / yw[1] : 0.0f;
+  *outR = r;
+  *outG = g;
+  *outB = b;
+}
+
+static void ReconstructChromaHoriz(int n, const YcaPixel *ycaIn, YcaPixel *ycaOut) {
+  // Port of OpenEXR RgbaYca::reconstructChromaHoriz (ImfRgbaYca.cpp).
+  const int begin = kYcaFilterN2;
+  const int end = begin + n;
+  for (int i = begin, j = 0; i < end; ++i, ++j) {
+    if (j & 1) {
+      ycaOut[j].r =
+          ycaIn[i - 13].r * 0.002128f + ycaIn[i - 11].r * -0.007540f +
+          ycaIn[i - 9].r * 0.019597f + ycaIn[i - 7].r * -0.043159f +
+          ycaIn[i - 5].r * 0.087929f + ycaIn[i - 3].r * -0.186077f +
+          ycaIn[i - 1].r * 0.627123f + ycaIn[i + 1].r * 0.627123f +
+          ycaIn[i + 3].r * -0.186077f + ycaIn[i + 5].r * 0.087929f +
+          ycaIn[i + 7].r * -0.043159f + ycaIn[i + 9].r * 0.019597f +
+          ycaIn[i + 11].r * -0.007540f + ycaIn[i + 13].r * 0.002128f;
+      ycaOut[j].b =
+          ycaIn[i - 13].b * 0.002128f + ycaIn[i - 11].b * -0.007540f +
+          ycaIn[i - 9].b * 0.019597f + ycaIn[i - 7].b * -0.043159f +
+          ycaIn[i - 5].b * 0.087929f + ycaIn[i - 3].b * -0.186077f +
+          ycaIn[i - 1].b * 0.627123f + ycaIn[i + 1].b * 0.627123f +
+          ycaIn[i + 3].b * -0.186077f + ycaIn[i + 5].b * 0.087929f +
+          ycaIn[i + 7].b * -0.043159f + ycaIn[i + 9].b * 0.019597f +
+          ycaIn[i + 11].b * -0.007540f + ycaIn[i + 13].b * 0.002128f;
+    } else {
+      ycaOut[j].r = ycaIn[i].r;
+      ycaOut[j].b = ycaIn[i].b;
+    }
+    ycaOut[j].g = ycaIn[i].g;
+    ycaOut[j].a = ycaIn[i].a;
+  }
+}
+
+static void ReconstructChromaVert(int n, const YcaPixel *const ycaIn[kYcaFilterN],
+                                  YcaPixel *ycaOut) {
+  // Port of OpenEXR RgbaYca::reconstructChromaVert.
+  for (int i = 0; i < n; ++i) {
+    ycaOut[i].r =
+        ycaIn[0][i].r * 0.002128f + ycaIn[2][i].r * -0.007540f +
+        ycaIn[4][i].r * 0.019597f + ycaIn[6][i].r * -0.043159f +
+        ycaIn[8][i].r * 0.087929f + ycaIn[10][i].r * -0.186077f +
+        ycaIn[12][i].r * 0.627123f + ycaIn[14][i].r * 0.627123f +
+        ycaIn[16][i].r * -0.186077f + ycaIn[18][i].r * 0.087929f +
+        ycaIn[20][i].r * -0.043159f + ycaIn[22][i].r * 0.019597f +
+        ycaIn[24][i].r * -0.007540f + ycaIn[26][i].r * 0.002128f;
+    ycaOut[i].b =
+        ycaIn[0][i].b * 0.002128f + ycaIn[2][i].b * -0.007540f +
+        ycaIn[4][i].b * 0.019597f + ycaIn[6][i].b * -0.043159f +
+        ycaIn[8][i].b * 0.087929f + ycaIn[10][i].b * -0.186077f +
+        ycaIn[12][i].b * 0.627123f + ycaIn[14][i].b * 0.627123f +
+        ycaIn[16][i].b * -0.186077f + ycaIn[18][i].b * 0.087929f +
+        ycaIn[20][i].b * -0.043159f + ycaIn[22][i].b * 0.019597f +
+        ycaIn[24][i].b * -0.007540f + ycaIn[26][i].b * 0.002128f;
+    ycaOut[i].g = ycaIn[kYcaFilterN2][i].g;
+    ycaOut[i].a = ycaIn[kYcaFilterN2][i].a;
+  }
+}
+
+static bool IsLuminanceChromaLayout(const std::vector<LayerChannel> &channels) {
+  bool hasY = false;
+  bool hasRY = false;
+  bool hasBY = false;
+  for (size_t i = 0; i < channels.size(); i++) {
+    if (channels[i].name == "Y") hasY = true;
+    if (channels[i].name == "RY") hasRY = true;
+    if (channels[i].name == "BY") hasBY = true;
+  }
+  return hasY && hasRY && hasBY;
+}
+
+static bool IsLuminanceChromaChannelNames(const EXRHeader &exr_header,
+                                          const char *layer_name) {
+  std::vector<LayerChannel> channels;
+  ChannelsInLayer(exr_header, layer_name ? std::string(layer_name) : std::string(""),
+                  channels);
+  return IsLuminanceChromaLayout(channels);
+}
+
+static float GetChannelFloatScanline(const EXRHeader &exr_header,
+                                     const EXRImage &exr_image, int chIdx,
+                                     int x, int y, int width) {
+  const EXRChannelInfo &ch = exr_header.channels[chIdx];
+  const int xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+  const int ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+  // Subsampled channels are stored compactly at y * width + x/xs on valid rows.
+  // Subsampled channels are stored compactly at y * width + x/xs on valid rows.
+  if (xs > 1 || ys > 1) {
+    if ((x % xs) != 0 || (y % ys) != 0) {
+      return 0.0f;
+    }
+  }
+  const size_t idx =
+      static_cast<size_t>(y) * static_cast<size_t>(width) +
+      static_cast<size_t>(x / xs);
+  return reinterpret_cast<float **>(exr_image.images)[chIdx][idx];
+}
+
+static float GetChannelFloatTiled(const EXRHeader &exr_header,
+                                  const EXRImage &exr_image, int chIdx, int x,
+                                  int y, int width, int height) {
+  if (!exr_header.tiled || exr_image.tiles == NULL) {
+    return 0.0f;
+  }
+  const size_t tile_size_x = static_cast<size_t>(exr_header.tile_size_x);
+  const size_t tile_size_y = static_cast<size_t>(exr_header.tile_size_y);
+  const EXRChannelInfo &ch = exr_header.channels[chIdx];
+  const int xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+  const int ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+  for (int it = 0; it < exr_image.num_tiles; it++) {
+    const size_t tile_origin_x =
+        static_cast<size_t>(exr_image.tiles[it].offset_x) * tile_size_x;
+    const size_t tile_origin_y =
+        static_cast<size_t>(exr_image.tiles[it].offset_y) * tile_size_y;
+    if (static_cast<size_t>(x) >= tile_origin_x &&
+        static_cast<size_t>(x) < tile_origin_x + tile_size_x &&
+        static_cast<size_t>(y) >= tile_origin_y &&
+        static_cast<size_t>(y) < tile_origin_y + tile_size_y) {
+      const size_t local_x = static_cast<size_t>(x) - tile_origin_x;
+      const size_t local_y = static_cast<size_t>(y) - tile_origin_y;
+      if (xs > 1 || ys > 1) {
+        if ((local_x % static_cast<size_t>(xs)) != 0 ||
+            (local_y % static_cast<size_t>(ys)) != 0) {
+          return 0.0f;
+        }
+      }
+      const size_t srcIdx =
+          local_y * tile_size_x + local_x / static_cast<size_t>(xs);
+      unsigned char **src = exr_image.tiles[it].images;
+      return reinterpret_cast<float **>(src)[chIdx][srcIdx];
+    }
+  }
+  (void)width;
+  (void)height;
+  return 0.0f;
+}
+
+struct RgbaPixel {
+  float r;
+  float g;
+  float b;
+  float a;
+};
+
+static float RgbaSaturation(const RgbaPixel &in) {
+  const float rgbMax = (std::max)(in.r, (std::max)(in.g, in.b));
+  const float rgbMin = (std::min)(in.r, (std::min)(in.g, in.b));
+  if (rgbMax > 0.0f) {
+    return 1.0f - rgbMin / rgbMax;
+  }
+  return 0.0f;
+}
+
+static void DesaturateRgba(const RgbaPixel &in, float f, const float yw[3],
+                           RgbaPixel *out) {
+  const float rgbMax = (std::max)(in.r, (std::max)(in.g, in.b));
+  out->r = (std::max)(rgbMax - (rgbMax - in.r) * f, 0.0f);
+  out->g = (std::max)(rgbMax - (rgbMax - in.g) * f, 0.0f);
+  out->b = (std::max)(rgbMax - (rgbMax - in.b) * f, 0.0f);
+  out->a = in.a;
+  const float yIn = in.r * yw[0] + in.g * yw[1] + in.b * yw[2];
+  const float yOut = out->r * yw[0] + out->g * yw[1] + out->b * yw[2];
+  if (yOut > 0.0f) {
+    const float scale = yIn / yOut;
+    out->r *= scale;
+    out->g *= scale;
+    out->b *= scale;
+  }
+}
+
+static void FixSaturation(const float yw[3], int n,
+                          const RgbaPixel *const rgbaIn[3],
+                          RgbaPixel *rgbaOut) {
+  // Port of OpenEXR RgbaYca::fixSaturation (ImfRgbaYca.cpp).
+  float neighborA2 = RgbaSaturation(rgbaIn[0][0]);
+  float neighborA1 = neighborA2;
+  float neighborB2 = RgbaSaturation(rgbaIn[2][0]);
+  float neighborB1 = neighborB2;
+  for (int i = 0; i < n; ++i) {
+    const float neighborA0 = neighborA1;
+    neighborA1 = neighborA2;
+    const float neighborB0 = neighborB1;
+    neighborB1 = neighborB2;
+    if (i < n - 1) {
+      neighborA2 = RgbaSaturation(rgbaIn[0][i + 1]);
+      neighborB2 = RgbaSaturation(rgbaIn[2][i + 1]);
+    }
+    const float sMean = (std::min)(
+        1.0f, 0.25f * (neighborA0 + neighborA2 + neighborB0 + neighborB2));
+    const RgbaPixel &in = rgbaIn[1][i];
+    RgbaPixel &out = rgbaOut[i];
+    const float s = RgbaSaturation(in);
+    if (s > sMean) {
+      const float sMax = (std::min)(1.0f, 1.0f - (1.0f - sMean) * 0.25f);
+      if (s > sMax) {
+        DesaturateRgba(in, sMax / s, yw, &out);
+        continue;
+      }
+    }
+    out = in;
+  }
+}
+
+static void PadYcaTmpBuf(int width, YcaPixel *rowPadded, const YcaPixel *rowIn) {
+  // Port of OpenEXR RgbaInputFile::FromYca::padTmpBuf.
+  for (int i = 0; i < kYcaFilterN2; ++i) {
+    rowPadded[i] = rowIn[0];
+  }
+  for (int x = 0; x < width; ++x) {
+    rowPadded[kYcaFilterN2 + x] = rowIn[x];
+  }
+  const int edgeIdx = width >= 2 ? width - 2 : 0;
+  for (int i = 0; i < kYcaFilterN2; ++i) {
+    rowPadded[kYcaFilterN2 + width + i] = rowIn[edgeIdx];
+  }
+}
+
+static bool ConvertYCAToRGBA(const EXRHeader &exr_header,
+                             const EXRImage &exr_image, int idxY, int idxRY,
+                             int idxBY, int idxA, float **out_rgba,
+                             const char **err) {
+  const int width = exr_image.width;
+  const int height = exr_image.height;
+  if (width <= 0 || height <= 0) {
+    SetErrorMessage("Invalid image dimensions for YCA conversion", err);
+    return false;
+  }
+
+  const EXRChannelInfo &chRY = exr_header.channels[idxRY];
+  const int chromaXs = chRY.x_sampling > 0 ? chRY.x_sampling : 1;
+  const int chromaYs = chRY.y_sampling > 0 ? chRY.y_sampling : 1;
+  const bool needsChromaUpsample = (chromaXs > 1 || chromaYs > 1);
+
+  const size_t pixel_count =
+      static_cast<size_t>(width) * static_cast<size_t>(height);
+  std::vector<YcaPixel> ycaRaw(pixel_count);
+  std::vector<YcaPixel> ycaProcessed(pixel_count);
+  std::vector<RgbaPixel> rgbPreSat(pixel_count);
+  std::vector<RgbaPixel> rgbFinal(pixel_count);
+
+  // Build sparse YCA buffer from decoded channel planes.
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      const size_t idx =
+          static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
+      YcaPixel &p = ycaRaw[idx];
+      if (exr_header.tiled) {
+        p.g = GetChannelFloatTiled(exr_header, exr_image, idxY, x, y, width, height);
+        p.r = 0.0f;
+        p.b = 0.0f;
+        if ((x % chromaXs) == 0 && (y % chromaYs) == 0) {
+          p.r = GetChannelFloatTiled(exr_header, exr_image, idxRY, x, y, width, height);
+          p.b = GetChannelFloatTiled(exr_header, exr_image, idxBY, x, y, width, height);
+        }
+        if (idxA >= 0) {
+          p.a = GetChannelFloatTiled(exr_header, exr_image, idxA, x, y, width, height);
+        } else {
+          p.a = 1.0f;
+        }
+      } else {
+        p.g = GetChannelFloatScanline(exr_header, exr_image, idxY, x, y, width);
+        p.r = 0.0f;
+        p.b = 0.0f;
+        if ((x % chromaXs) == 0 && (y % chromaYs) == 0) {
+          p.r = GetChannelFloatScanline(exr_header, exr_image, idxRY, x, y, width);
+          p.b = GetChannelFloatScanline(exr_header, exr_image, idxBY, x, y, width);
+        }
+        if (idxA >= 0) {
+          p.a = GetChannelFloatScanline(exr_header, exr_image, idxA, x, y, width);
+        } else {
+          p.a = 1.0f;
+        }
+      }
+    }
+  }
+
+  const int pad = kYcaFilterN - 1;
+  std::vector<YcaPixel> rowPadded(static_cast<size_t>(width) + static_cast<size_t>(pad));
+  std::vector<YcaPixel> rowVertBuf(static_cast<size_t>(width));
+
+  // readYCAScanLine equivalent: horizontal recon on even chroma rows only.
+  for (int y = 0; y < height; y++) {
+    const YcaPixel *rowIn =
+        &ycaRaw[static_cast<size_t>(y) * static_cast<size_t>(width)];
+    YcaPixel *rowOut =
+        &ycaProcessed[static_cast<size_t>(y) * static_cast<size_t>(width)];
+
+    if (!needsChromaUpsample) {
+      for (int x = 0; x < width; x++) {
+        rowOut[x] = rowIn[x];
+      }
+      continue;
+    }
+
+    if ((y % chromaYs) == 0) {
+      // Even chroma row: pad edges and reconstruct missing horizontal chroma.
+      PadYcaTmpBuf(width, &rowPadded[0], rowIn);
+      ReconstructChromaHoriz(width, &rowPadded[0], rowOut);
+    } else {
+      // Odd chroma row: luminance only, chroma stays zero until vertical recon.
+      for (int x = 0; x < width; x++) {
+        rowOut[x].g = rowIn[x].g;
+        rowOut[x].a = rowIn[x].a;
+        rowOut[x].r = 0.0f;
+        rowOut[x].b = 0.0f;
+      }
+    }
+  }
+
+  Chromaticities chroma = GetChromaticities(exr_header);
+  float yw[3];
+  ComputeYw(chroma, yw);
+
+  // Convert YCA rows to RGB. Odd rows need vertical chroma reconstruction.
+  for (int y = 0; y < height; y++) {
+    const YcaPixel *srcRow =
+        &ycaProcessed[static_cast<size_t>(y) * static_cast<size_t>(width)];
+    RgbaPixel *dstRow =
+        &rgbPreSat[static_cast<size_t>(y) * static_cast<size_t>(width)];
+
+    if (needsChromaUpsample && chromaYs > 1 && (y % chromaYs) != 0) {
+      // Odd row: vertical chroma upsampling then YCA to RGB.
+      const YcaPixel *rowsIn[kYcaFilterN];
+      for (int k = 0; k < kYcaFilterN; k++) {
+        int srcY = y - kYcaFilterN2 + k;
+        if (srcY < 0) {
+          srcY = 0;
+        }
+        if (srcY >= height) {
+          srcY = height - 1;
+        }
+        rowsIn[k] =
+            &ycaProcessed[static_cast<size_t>(srcY) * static_cast<size_t>(width)];
+      }
+      ReconstructChromaVert(width, rowsIn, &rowVertBuf[0]);
+      for (int x = 0; x < width; x++) {
+        YCAtoRGBA(yw, rowVertBuf[static_cast<size_t>(x)].g,
+                  rowVertBuf[static_cast<size_t>(x)].r,
+                  rowVertBuf[static_cast<size_t>(x)].b, &dstRow[x].r, &dstRow[x].g,
+                  &dstRow[x].b);
+        dstRow[x].a = rowVertBuf[static_cast<size_t>(x)].a;
+      }
+    } else {
+      // Even row (or no vertical subsampling): direct YCA to RGB.
+      for (int x = 0; x < width; x++) {
+        YCAtoRGBA(yw, srcRow[x].g, srcRow[x].r, srcRow[x].b, &dstRow[x].r,
+                  &dstRow[x].g, &dstRow[x].b);
+        dstRow[x].a = srcRow[x].a;
+      }
+    }
+  }
+
+  // fixSaturation uses a 3-row sliding window per output scanline.
+  for (int y = 0; y < height; y++) {
+    const RgbaPixel *rowsIn[3];
+    for (int k = 0; k < 3; k++) {
+      int srcY = y - 1 + k;
+      if (srcY < 0) {
+        srcY = 0;
+      }
+      if (srcY >= height) {
+        srcY = height - 1;
+      }
+      rowsIn[k] = &rgbPreSat[static_cast<size_t>(srcY) * static_cast<size_t>(width)];
+    }
+    FixSaturation(yw, width, rowsIn,
+                  &rgbFinal[static_cast<size_t>(y) * static_cast<size_t>(width)]);
+  }
+
+  (*out_rgba) = reinterpret_cast<float *>(
+      malloc(4 * sizeof(float) * pixel_count));
+  if (*out_rgba == NULL) {
+    SetErrorMessage("Failed to allocate memory for YCA RGBA output", err);
+    return false;
+  }
+
+  for (size_t idx = 0; idx < pixel_count; idx++) {
+    const RgbaPixel &p = rgbFinal[idx];
+    (*out_rgba)[4 * idx + 0] = p.r;
+    (*out_rgba)[4 * idx + 1] = p.g;
+    (*out_rgba)[4 * idx + 2] = p.b;
+    (*out_rgba)[4 * idx + 3] = p.a;
+  }
+  return true;
+}
+
 }  // namespace tinyexr
 
 int EXRLayers(const char *filename, const char **layer_names[], int *num_layers,
@@ -7768,11 +8335,14 @@ int LoadEXRWithLayer(float **out_rgba, int *width, int *height,
     }
   }
 
-  // RGBA
+  // RGBA / YCA channel indices
   int idxR = -1;
   int idxG = -1;
   int idxB = -1;
   int idxA = -1;
+  int idxY = -1;
+  int idxRY = -1;
+  int idxBY = -1;
 
   std::vector<std::string> layer_names;
   tinyexr::GetLayers(exr_header, layer_names);
@@ -7794,8 +8364,7 @@ int LoadEXRWithLayer(float **out_rgba, int *width, int *height,
     return TINYEXR_ERROR_LAYER_NOT_FOUND;
   }
 
-  size_t ch_count = channels.size() < 4 ? channels.size() : 4;
-  for (size_t c = 0; c < ch_count; c++) {
+  for (size_t c = 0; c < channels.size(); c++) {
     const tinyexr::LayerChannel &ch = channels[c];
 
     if (ch.name == "R") {
@@ -7806,7 +8375,27 @@ int LoadEXRWithLayer(float **out_rgba, int *width, int *height,
       idxB = int(ch.index);
     } else if (ch.name == "A") {
       idxA = int(ch.index);
+    } else if (ch.name == "Y") {
+      idxY = int(ch.index);
+    } else if (ch.name == "RY") {
+      idxRY = int(ch.index);
+    } else if (ch.name == "BY") {
+      idxBY = int(ch.index);
     }
+  }
+
+  if (tinyexr::IsLuminanceChromaLayout(channels)) {
+    if (!tinyexr::ConvertYCAToRGBA(exr_header, exr_image, idxY, idxRY, idxBY,
+                                   idxA, out_rgba, err)) {
+      FreeEXRHeader(&exr_header);
+      FreeEXRImage(&exr_image);
+      return TINYEXR_ERROR_INVALID_DATA;
+    }
+    (*width) = exr_image.width;
+    (*height) = exr_image.height;
+    FreeEXRHeader(&exr_header);
+    FreeEXRImage(&exr_image);
+    return TINYEXR_SUCCESS;
   }
 
   if (channels.size() == 1) {
@@ -8085,21 +8674,52 @@ int LoadEXRFromMemory(float **out_rgba, int *width, int *height,
     return ret;
   }
 
-  // RGBA
+  // RGBA / YCA channel indices
   int idxR = -1;
   int idxG = -1;
   int idxB = -1;
   int idxA = -1;
+  int idxY = -1;
+  int idxRY = -1;
+  int idxBY = -1;
+
+  std::vector<tinyexr::LayerChannel> layer_channels;
   for (int c = 0; c < exr_header.num_channels; c++) {
-    if (strcmp(exr_header.channels[c].name, "R") == 0) {
-      idxR = c;
-    } else if (strcmp(exr_header.channels[c].name, "G") == 0) {
-      idxG = c;
-    } else if (strcmp(exr_header.channels[c].name, "B") == 0) {
-      idxB = c;
-    } else if (strcmp(exr_header.channels[c].name, "A") == 0) {
-      idxA = c;
+    tinyexr::LayerChannel ch(size_t(c), std::string(exr_header.channels[c].name));
+    layer_channels.push_back(ch);
+  }
+
+  for (size_t c = 0; c < layer_channels.size(); c++) {
+    const tinyexr::LayerChannel &ch = layer_channels[c];
+    if (ch.name == "R") {
+      idxR = int(ch.index);
+    } else if (ch.name == "G") {
+      idxG = int(ch.index);
+    } else if (ch.name == "B") {
+      idxB = int(ch.index);
+    } else if (ch.name == "A") {
+      idxA = int(ch.index);
+    } else if (ch.name == "Y") {
+      idxY = int(ch.index);
+    } else if (ch.name == "RY") {
+      idxRY = int(ch.index);
+    } else if (ch.name == "BY") {
+      idxBY = int(ch.index);
     }
+  }
+
+  if (tinyexr::IsLuminanceChromaLayout(layer_channels)) {
+    if (!tinyexr::ConvertYCAToRGBA(exr_header, exr_image, idxY, idxRY, idxBY,
+                                   idxA, out_rgba, err)) {
+      FreeEXRHeader(&exr_header);
+      FreeEXRImage(&exr_image);
+      return TINYEXR_ERROR_INVALID_DATA;
+    }
+    (*width) = exr_image.width;
+    (*height) = exr_image.height;
+    FreeEXRHeader(&exr_header);
+    FreeEXRImage(&exr_image);
+    return TINYEXR_SUCCESS;
   }
 
   // TODO(syoyo): Refactor removing same code as used in LoadEXR().

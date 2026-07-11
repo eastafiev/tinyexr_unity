@@ -79,6 +79,7 @@ namespace TinyEXR
             public int isDeepImage;
             public int isTiled;
             public int isSpectral;
+            public int isYca;
             public int hasLayers;
             public int layerCount;
             public int partCount;
@@ -93,6 +94,7 @@ namespace TinyEXR
             public bool IsDeepImage => isDeepImage != 0;
             public bool IsTiled => isTiled != 0;
             public bool IsSpectral => isSpectral != 0;
+            public bool IsYca => isYca != 0;
             public bool HasLayers => hasLayers != 0;
 
             /// <summary>

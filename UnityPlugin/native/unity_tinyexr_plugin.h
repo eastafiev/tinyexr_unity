@@ -60,6 +60,7 @@ typedef struct {
     int isDeepImage;
     int isTiled;
     int isSpectral;
+    int isYca;
     int hasLayers;
     int layerCount;
     int partCount;

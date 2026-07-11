@@ -125,6 +125,43 @@ static bool HasSpectralLayout(const EXRHeader& header) {
     return false;
 }
 
+// Helper: Check if channels in a layer use OpenEXR luminance/chroma (Y/RY/BY)
+static bool HasYcaLayout(const EXRHeader& header, const char* layerName) {
+    bool hasY = false;
+    bool hasRY = false;
+    bool hasBY = false;
+    const std::string layerPrefix =
+        (layerName != nullptr && layerName[0] != '\0')
+            ? std::string(layerName) + "."
+            : std::string();
+
+    for (int i = 0; i < header.num_channels; i++) {
+        std::string channelName(header.channels[i].name);
+        std::string shortName = channelName;
+
+        if (!layerPrefix.empty()) {
+            if (channelName.find(layerPrefix) != 0) {
+                continue;
+            }
+            shortName = channelName.substr(layerPrefix.size());
+        } else {
+            const size_t dotPos = channelName.find('.');
+            if (dotPos != std::string::npos && dotPos != 0) {
+                continue;
+            }
+            if (dotPos == 0 && dotPos + 1 < channelName.size()) {
+                shortName = channelName.substr(dotPos + 1);
+            }
+        }
+
+        if (shortName == "Y") hasY = true;
+        if (shortName == "RY") hasRY = true;
+        if (shortName == "BY") hasBY = true;
+    }
+
+    return hasY && hasRY && hasBY;
+}
+
 // Helper: Check if compression type is supported by this build
 static bool IsCompressionSupported(int compressionType) {
     if (compressionType == TINYEXR_COMPRESSIONTYPE_DWAA ||
@@ -373,6 +410,8 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRCompatibilityForUnity(
             return TINYEXR_ERROR_LAYER_NOT_FOUND;
         }
     }
+
+    outInfo->isYca = HasYcaLayout(exrHeader, layerName) ? 1 : 0;
 
     FreeEXRHeader(&exrHeader);
     outInfo->isSupported = 1;
