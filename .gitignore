@@ -27,3 +27,12 @@ build.ninja
 .ninja_deps
 .ninja_log
 *.tlog
+
+# Visual Studio / VS Code local
+.vs/
+.vscode/
+
+# Built binaries
+*.exe
+*.pdb
+*.ilk
