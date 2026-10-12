@@ -83,12 +83,18 @@ echo.
 echo ============================================
 echo BUILD SUCCESSFUL
 echo ============================================
-echo Output: %BUILD_DIR%\bin\
+echo Package: %~dp0dist\
 if defined UNITY_PROJECT (
-    echo Deployed to: %UNITY_PROJECT%\Assets\Plugins\
+    echo Deployed to: %UNITY_PROJECT%\Assets\
 )
 echo ============================================
 echo.
+
+REM Open staged package folder in Explorer
+if exist "%~dp0dist\" (
+    explorer "%~dp0dist"
+)
+
 exit /b 0
 
 :error

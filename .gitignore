@@ -13,6 +13,8 @@ build_vs/
 CMakeFiles/
 build_unity/
 build_plugin/
+build/
+dist/
 *.sln
 *.vcxproj
 *.vcxproj.filters

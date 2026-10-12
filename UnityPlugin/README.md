@@ -13,13 +13,25 @@ A native Unity plugin for loading OpenEXR (.exr) files with multi-layer support.
 
 ## Building
 
+Every successful build stages a Unity Assets-shaped package at repo-root `dist/` and opens that folder:
+
+```
+dist/
+  Plugins/x86_64/UnityTinyEXR.dll          (Windows)
+  Plugins/macOS/libUnityTinyEXR.bundle     (macOS)
+  Plugins/Linux/x86_64/libUnityTinyEXR.so  (Linux)
+  Scripts/TinyEXR/TinyEXRLoader.cs
+```
+
+Copy `dist/Plugins` and `dist/Scripts` into your Unity project's `Assets/` folder.
+
 ### Windows
 
 ```cmd
 build.bat
 ```
 
-Or with Unity deployment:
+Or with Unity deployment (also copies into the project):
 
 ```cmd
 build.bat --unity "C:\Path\To\UnityProject"
@@ -48,22 +60,22 @@ Or with Unity deployment:
 
 ## Installation (Manual)
 
-1. Build the plugin using the build script
-2. Copy files to your Unity project:
+1. Build the plugin using the build script (`dist/` opens when finished)
+2. Copy `dist/Plugins` and `dist/Scripts` into your Unity project's `Assets/`:
 
 ```
 YourUnityProject/
-??? Assets/
-?   ??? Plugins/
-?   ?   ??? x86_64/
-?   ?       ??? UnityTinyEXR.dll       (Windows)
-?   ?   ??? macOS/
-?   ?       ??? libUnityTinyEXR.bundle (macOS)
-?   ?   ??? Linux/x86_64/
-?   ?       ??? libUnityTinyEXR.so     (Linux)
-?   ??? Scripts/
-?       ??? TinyEXR/
-?           ??? TinyEXRLoader.cs
+  Assets/
+    Plugins/
+      x86_64/
+        UnityTinyEXR.dll       (Windows)
+      macOS/
+        libUnityTinyEXR.bundle (macOS)
+      Linux/x86_64/
+        libUnityTinyEXR.so     (Linux)
+    Scripts/
+      TinyEXR/
+        TinyEXRLoader.cs
 ```
 
 ## Usage

@@ -1,4 +1,4 @@
-# Unity TinyEXR Plugin CMake Configuration
+# Standalone UnityPlugin CMake: build UnityTinyEXR and stage repo-root dist/ package.
 cmake_minimum_required(VERSION 3.5)
 project(UnityTinyEXRPlugin VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -10,6 +10,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Options
 option(USE_MINIZ "Use miniz instead of system zlib" ON)
 set(UNITY_PROJECT_PATH "" CACHE PATH "Path to Unity project for deployment")
+# Repo-root dist/ (this file lives in UnityPlugin/)
+set(DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../dist" CACHE PATH "Unity Assets-shaped package output directory")
 
 # Source files
 set(PLUGIN_SOURCES
@@ -98,9 +100,32 @@ set_target_properties(UnityTinyEXR PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-# Unity deployment
+# Platform folder under dist/Plugins (matches Unity Assets/Plugins layout)
+if(WIN32)
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/x86_64")
+elseif(APPLE)
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/macOS")
+else()
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/Linux/x86_64")
+endif()
+set(DIST_SCRIPTS_DIR "${DIST_DIR}/Scripts/TinyEXR")
+set(CSHARP_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/csharp/TinyEXRLoader.cs")
+
+# Always stage DLL + C# into repo-root dist/ after build
+add_custom_command(TARGET UnityTinyEXR POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_PLATFORM_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_SCRIPTS_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:UnityTinyEXR>
+        "${DIST_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CSHARP_WRAPPER}"
+        "${DIST_SCRIPTS_DIR}/TinyEXRLoader.cs"
+    COMMENT "Staging package to: ${DIST_DIR}"
+)
+
+# Optional: also copy staged layout into a live Unity project's Assets/
 if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
-    # Determine platform subdirectory
     if(WIN32)
         set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/x86_64")
     elseif(APPLE)
@@ -108,38 +133,20 @@ if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
     else()
         set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
     endif()
-    
-    # Create directory
-    file(MAKE_DIRECTORY "${UNITY_PLATFORM_DIR}")
-    
-    # Copy plugin after build
+    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
+
     add_custom_command(TARGET UnityTinyEXR POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_PLATFORM_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_SCRIPTS_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:UnityTinyEXR>
             "${UNITY_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
-        COMMENT "Deploying plugin to Unity: ${UNITY_PLATFORM_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CSHARP_WRAPPER}"
+            "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
+        COMMENT "Deploying to Unity: ${UNITY_PROJECT_PATH}/Assets"
     )
-    
-    # Copy C# wrapper
-    set(CSHARP_FILES
-        csharp/TinyEXRLoader.cs
-    )
-    
-    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
-    file(MAKE_DIRECTORY "${UNITY_SCRIPTS_DIR}")
-    
-    foreach(CS_FILE ${CSHARP_FILES})
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CS_FILE}")
-            get_filename_component(CS_NAME ${CS_FILE} NAME)
-            add_custom_command(TARGET UnityTinyEXR POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy
-                    "${CMAKE_CURRENT_SOURCE_DIR}/${CS_FILE}"
-                    "${UNITY_SCRIPTS_DIR}/${CS_NAME}"
-                COMMENT "Deploying ${CS_NAME} to Unity"
-            )
-        endif()
-    endforeach()
-    
+
     message(STATUS "Unity deployment enabled: ${UNITY_PLATFORM_DIR}")
 endif()
 
@@ -160,7 +167,8 @@ elseif(APPLE)
 else()
     message(STATUS "Output file: libUnityTinyEXR.so")
 endif()
-message(STATUS "Output directory: ${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Build output: ${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Package (dist): ${DIST_DIR}")
 if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
     message(STATUS "Unity deploy directory: ${UNITY_PLATFORM_DIR}")
 endif()

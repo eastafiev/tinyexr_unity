@@ -1,15 +1,22 @@
 @echo off
 setlocal
 
+REM ============================================
+REM Build Unity TinyEXR plugin (UnityPlugin CMake)
+REM Stages package to repo-root dist\ and opens it.
+REM ============================================
+
 echo.
 echo ============================================
 echo Building Unity TinyEXR Plugin (Standalone)
 echo ============================================
 echo.
 
-REM Set paths using C:\D\ format
-set "SOURCE_DIR=C:\D\Projects_My\TinyExrUnity"
-set "BUILD_DIR=C:\D\Projects_My\TinyExrUnity\build_unity"
+REM Paths relative to this script (repo root)
+set "SOURCE_DIR=%~dp0"
+set "SOURCE_DIR=%SOURCE_DIR:~0,-1%"
+set "BUILD_DIR=%SOURCE_DIR%\build_unity"
+set "DIST_DIR=%SOURCE_DIR%\dist"
 set "UNITY_PROJECT=%~1"
 
 REM Clean build directory
@@ -23,7 +30,7 @@ mkdir "%BUILD_DIR%"
 
 REM Configure - use UnityPlugin/CMakeLists.txt directly
 echo Configuring CMake...
-cd "%BUILD_DIR%"
+cd /d "%BUILD_DIR%"
 
 if "%UNITY_PROJECT%"=="" (
     cmake -G "Visual Studio 17 2022" -A x64 "%SOURCE_DIR%\UnityPlugin"
@@ -52,11 +59,16 @@ echo.
 echo ============================================
 echo BUILD SUCCESSFUL!
 echo ============================================
-echo Output: %BUILD_DIR%\bin\UnityTinyEXR.dll
+echo Package: %DIST_DIR%\
 if not "%UNITY_PROJECT%"=="" (
-    echo Deployed to: %UNITY_PROJECT%\Assets\Plugins\
+    echo Deployed to: %UNITY_PROJECT%\Assets\
 )
 echo ============================================
 echo.
+
+REM Open staged package folder in Explorer
+if exist "%DIST_DIR\" (
+    explorer "%DIST_DIR%"
+)
 
 exit /b 0

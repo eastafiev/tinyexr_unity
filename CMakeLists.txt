@@ -1,3 +1,4 @@
+# Root CMake: build UnityTinyEXR native plugin and stage Assets-shaped dist/ package.
 cmake_minimum_required(VERSION 3.5)
 project(UnityTinyEXRPlugin VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -9,6 +10,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Options
 option(USE_MINIZ "Use miniz instead of system zlib" ON)
 set(UNITY_PROJECT_PATH "" CACHE PATH "Path to Unity project for deployment")
+# Final package folder at repo root (Plugins + Scripts for drop-into Unity Assets)
+set(DIST_DIR "${CMAKE_SOURCE_DIR}/dist" CACHE PATH "Unity Assets-shaped package output directory")
 
 # Source files
 set(PLUGIN_SOURCES
@@ -95,7 +98,31 @@ set_target_properties(UnityTinyEXR PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-# Unity deployment
+# Platform folder under dist/Plugins (matches Unity Assets/Plugins layout)
+if(WIN32)
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/x86_64")
+elseif(APPLE)
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/macOS")
+else()
+    set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/Linux/x86_64")
+endif()
+set(DIST_SCRIPTS_DIR "${DIST_DIR}/Scripts/TinyEXR")
+set(CSHARP_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs")
+
+# Always stage DLL + C# into dist/ after build
+add_custom_command(TARGET UnityTinyEXR POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_PLATFORM_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_SCRIPTS_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:UnityTinyEXR>
+        "${DIST_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CSHARP_WRAPPER}"
+        "${DIST_SCRIPTS_DIR}/TinyEXRLoader.cs"
+    COMMENT "Staging package to: ${DIST_DIR}"
+)
+
+# Optional: also copy staged layout into a live Unity project's Assets/
 if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
     if(WIN32)
         set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/x86_64")
@@ -104,29 +131,20 @@ if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
     else()
         set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
     endif()
-    
-    file(MAKE_DIRECTORY "${UNITY_PLATFORM_DIR}")
-    
+    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
+
     add_custom_command(TARGET UnityTinyEXR POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_PLATFORM_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_SCRIPTS_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:UnityTinyEXR>
             "${UNITY_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
-        COMMENT "Deploying to: ${UNITY_PLATFORM_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CSHARP_WRAPPER}"
+            "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
+        COMMENT "Deploying to Unity: ${UNITY_PROJECT_PATH}/Assets"
     )
-    
-    # Copy C# wrapper
-    set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
-    file(MAKE_DIRECTORY "${UNITY_SCRIPTS_DIR}")
-    
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs")
-        add_custom_command(TARGET UnityTinyEXR POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy
-                "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs"
-                "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
-            COMMENT "Deploying C# wrapper"
-        )
-    endif()
-    
+
     message(STATUS "Unity deployment: ${UNITY_PLATFORM_DIR}")
 endif()
 
@@ -135,7 +153,8 @@ message(STATUS "==========================================")
 message(STATUS "Unity TinyEXR Plugin Configuration")
 message(STATUS "==========================================")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "Output: ${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Build output: ${CMAKE_BINARY_DIR}/bin")
+message(STATUS "Package (dist): ${DIST_DIR}")
 if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
     message(STATUS "Unity deploy: ${UNITY_PLATFORM_DIR}")
 endif()

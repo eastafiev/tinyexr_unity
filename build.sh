@@ -93,11 +93,23 @@ echo "Building..."
 cmake --build . --config "$BUILD_TYPE" $VERBOSE
 
 cd ..
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIST_DIR="$SCRIPT_DIR/dist"
+
 echo ""
 echo "============================================"
 echo "BUILD SUCCESSFUL"
 echo "============================================"
-echo "Output: $BUILD_DIR/bin/"
-[[ -n "$UNITY_PROJECT" ]] && echo "Deployed to: $UNITY_PROJECT/Assets/Plugins/"
+echo "Package: $DIST_DIR/"
+[[ -n "$UNITY_PROJECT" ]] && echo "Deployed to: $UNITY_PROJECT/Assets/"
 echo "============================================"
 echo ""
+
+# Open staged package folder in the OS file manager
+if [[ -d "$DIST_DIR" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+        open "$DIST_DIR"
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$DIST_DIR" >/dev/null 2>&1 || true
+    fi
+fi
