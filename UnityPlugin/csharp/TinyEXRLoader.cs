@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using Unity.Collections;
 using UnityEngine;
 
 namespace TinyEXR
@@ -265,7 +266,8 @@ namespace TinyEXR
             try
             {
                 ImageInfo info;
-                int result = LoadEXRWithResizeForUnity(filePath, width, height, out dataPtr, out info, ref options, out errorPtr);
+                int result = LoadEXRWithResizeForUnity(filePath, width, height, out dataPtr, out info, ref options,
+                    out errorPtr);
 
                 if (result != 0)
                 {
@@ -275,11 +277,20 @@ namespace TinyEXR
 
                 return CopyNativeToRaw(dataPtr, info);
             }
+            catch (Exception ex)
+            { 
+                
+                Debug.LogError($"{ex.Message}");
+                throw new InvalidOperationException();
+            }
+            
             finally
             {
                 if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
                 if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
             }
+
+           
         }
 
         /// <summary>
@@ -322,22 +333,22 @@ namespace TinyEXR
             if (raw.Data == null || raw.Data.Length == 0)
                 throw new ArgumentException("Raw EXR data is empty.", nameof(raw));
 
-            int pixelCount = raw.Width * raw.Height;
+            long pixelCount = (long)raw.Width * raw.Height;
             if (pixelCount <= 0)
                 throw new ArgumentException($"Invalid EXR dimensions: {raw.Width}x{raw.Height}.", nameof(raw));
 
             ValidateChannelCount(raw.NumChannels);
 
-            int expectedBytes = pixelCount * raw.NumChannels * sizeof(float);
-            if (raw.Data.Length != expectedBytes)
+            long expectedFloats = pixelCount * raw.NumChannels;
+            if (raw.Data.Length != expectedFloats)
             {
                 throw new ArgumentException(
-                    $"EXR byte count mismatch: got {raw.Data.Length}, expected {expectedBytes} for " +
+                    $"EXR float count mismatch: got {raw.Data.Length}, expected {expectedFloats} for " +
                     $"{raw.Width}x{raw.Height} with {raw.NumChannels} channels.",
                     nameof(raw));
             }
 
-            return CreateTextureFromBytes(raw.Data, raw.Width, raw.Height, linear);
+            return CreateTextureFromFloats(raw.Data, raw.Width, raw.Height, raw.NumChannels, linear);
         }
 
         /// <summary>
@@ -537,9 +548,28 @@ namespace TinyEXR
         {
             ValidateChannelCount(info.numChannels);
 
-            int byteCount = info.width * info.height * info.numChannels * sizeof(float);
-            var data = new byte[byteCount];
-            Marshal.Copy(dataPtr, data, 0, byteCount);
+            // A byte[] cannot hold 2 GiB. 16384x8192 RGBA float is exactly that size,
+            // so copy floats instead: the same image is 536,870,912 elements.
+            const int maxArrayLength = 0x7FFFFFC7;
+            long floatCount;
+            try
+            {
+                floatCount = checked((long)info.width * info.height * info.numChannels);
+            }
+            catch (OverflowException)
+            {
+                throw new InvalidOperationException(
+                    $"EXR buffer is too large to copy: {info.width}x{info.height}, {info.numChannels} channels.");
+            }
+
+            if (info.width <= 0 || info.height <= 0 || floatCount <= 0 || floatCount > maxArrayLength)
+            {
+                throw new InvalidOperationException(
+                    $"EXR buffer is too large to copy: {info.width}x{info.height}, {info.numChannels} channels ({floatCount} floats).");
+            }
+
+            var data = new float[(int)floatCount];
+            Marshal.Copy(dataPtr, data, 0, data.Length);
 
             return new ExrRawImageData
             {
@@ -568,12 +598,43 @@ namespace TinyEXR
                 linear);
         }
 
-        private static Texture2D CreateTextureFromBytes(byte[] data, int width, int height, bool linear)
+        private static Texture2D CreateTextureFromFloats(float[] pixels, int width, int height, int numChannels, bool linear)
         {
+            if (numChannels != 4)
+            {
+                throw new NotSupportedException(
+                    $"RGBAFloat upload requires 4 channels, got {numChannels}.");
+            }
+
             var texture = new Texture2D(width, height, TextureFormat.RGBAFloat, false, linear);
-            texture.LoadRawTextureData(data);
-            texture.Apply();
-            return texture;
+            try
+            {
+                var destination = texture.GetPixelData<float>(0);
+                if (destination.Length != pixels.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"Texture float buffer is {destination.Length}, EXR has {pixels.Length}.");
+                }
+
+                // SetPixelData builds a byte span with an int length, which overflows at 2 GiB.
+                // Copy into the texture CPU buffer in slices that stay under that limit.
+                const int floatsPerSlice = 32 * 1024 * 1024;
+                int offset = 0;
+                while (offset < pixels.Length)
+                {
+                    int count = Math.Min(floatsPerSlice, pixels.Length - offset);
+                    NativeArray<float>.Copy(pixels, offset, destination, offset, count);
+                    offset += count;
+                }
+
+                texture.Apply();
+                return texture;
+            }
+            catch
+            {
+                UnityEngine.Object.Destroy(texture);
+                throw;
+            }
         }
 
         private static Texture2D CreateTextureFromBytes(
