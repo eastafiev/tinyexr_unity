@@ -58,6 +58,7 @@ endif()
 # Definitions
 target_compile_definitions(UnityTinyEXR PRIVATE
     UNITY_TINYEXR_EXPORTS=1
+    TINYEXR_USE_THREAD=1
     $<$<BOOL:${USE_MINIZ}>:TINYEXR_USE_MINIZ=1>
 )
 
@@ -68,6 +69,43 @@ if(MSVC)
         NOMINMAX
     )
 endif()
+
+if(WIN32)
+    target_link_libraries(UnityTinyEXR PRIVATE psapi)
+endif()
+
+# Standalone resize benchmark. Compiles the plugin sources so it can call
+# LoadEXR directly as the bit-exact reference without a new DLL export.
+add_executable(exr_resize_bench
+    UnityPlugin/native/exr_resize_bench.cpp
+    ${PLUGIN_SOURCES}
+)
+target_include_directories(exr_resize_bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/native
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps/miniz
+)
+target_compile_definitions(exr_resize_bench PRIVATE
+    UNITY_TINYEXR_EXPORTS=1
+    TINYEXR_USE_THREAD=1
+    $<$<BOOL:${USE_MINIZ}>:TINYEXR_USE_MINIZ=1>
+)
+if(NOT USE_MINIZ)
+    target_link_libraries(exr_resize_bench PRIVATE ZLIB::ZLIB)
+endif()
+if(WIN32)
+    target_link_libraries(exr_resize_bench PRIVATE psapi)
+endif()
+if(MSVC)
+    target_compile_definitions(exr_resize_bench PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+endif()
+set_target_properties(exr_resize_bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
 
 # Platform-specific
 if(WIN32)

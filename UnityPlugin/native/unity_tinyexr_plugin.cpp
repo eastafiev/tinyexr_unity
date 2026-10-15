@@ -1,6 +1,11 @@
+// Unity native EXR loader. LoadEXRWithResizeForUnity times each decode stage
+// and returns malloc'd pixels that FreeImageData releases with free().
 #define TINYEXR_IMPLEMENTATION
 #define TINYEXR_USE_MINIZ 1
+// ZIP/PIZ chunks are independent. TinyEXR's worker pool decodes them in parallel.
+#define TINYEXR_USE_THREAD 1
 #include "../../tinyexr.h"
+#include <thread>
 #include "unity_tinyexr_plugin.h"
 
 #include <cstring>
@@ -9,6 +14,13 @@
 #include <vector>
 #include <string>
 #include <set>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <chrono>
+#ifdef _WIN32
+#include <psapi.h>
+#endif
 
 // Helper: Duplicate string
 static char* DuplicateString(const char* str) {
@@ -46,41 +58,190 @@ static void ApplyGamma(float* data, int width, int height, int channels, float g
     }
 }
 
-// Helper: Bilinear resize
-static float* ResizeBilinear(const float* srcData, int srcWidth, int srcHeight, int targetWidth, int targetHeight, int channels) {
-    float* dstData = new float[targetWidth * targetHeight * channels];
-    
-    float xRatio = static_cast<float>(srcWidth) / targetWidth;
-    float yRatio = static_cast<float>(srcHeight) / targetHeight;
-    
-    for (int y = 0; y < targetHeight; y++) {
+// Process memory at a stage boundary. Private bytes are the commit charge.
+struct ProcessMemorySample {
+    unsigned long long privateBytes;
+    unsigned long long workingSetBytes;
+    unsigned long long peakWorkingSetBytes;
+};
+
+// Read the current process commit and working set.
+static ProcessMemorySample SampleProcessMemory() {
+    ProcessMemorySample sample;
+    sample.privateBytes = 0;
+    sample.workingSetBytes = 0;
+    sample.peakWorkingSetBytes = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters;
+    memset(&counters, 0, sizeof(counters));
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+            sizeof(counters))) {
+        sample.privateBytes = static_cast<unsigned long long>(counters.PrivateUsage);
+        sample.workingSetBytes = static_cast<unsigned long long>(counters.WorkingSetSize);
+        sample.peakWorkingSetBytes = static_cast<unsigned long long>(counters.PeakWorkingSetSize);
+    }
+#elif defined(__linux__)
+    FILE* status = fopen("/proc/self/status", "r");
+    if (status) {
+        char line[256];
+        while (fgets(line, sizeof(line), status)) {
+            unsigned long long kib = 0;
+            if (sscanf(line, "VmRSS: %llu", &kib) == 1) {
+                sample.workingSetBytes = kib * 1024ull;
+            } else if (sscanf(line, "VmHWM: %llu", &kib) == 1) {
+                sample.peakWorkingSetBytes = kib * 1024ull;
+            } else if (sscanf(line, "VmSize: %llu", &kib) == 1) {
+                sample.privateBytes = kib * 1024ull;
+            }
+        }
+        fclose(status);
+    }
+#endif
+    return sample;
+}
+
+// High-resolution tick for stage timings.
+static long long StageNow() {
+#ifdef _WIN32
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+#else
+    return static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+
+// Convert a StageNow() delta to milliseconds.
+static double StageElapsedMs(long long startTicks) {
+#ifdef _WIN32
+    static LARGE_INTEGER frequency = {};
+    if (frequency.QuadPart == 0) {
+        QueryPerformanceFrequency(&frequency);
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now.QuadPart - startTicks) * 1000.0 /
+        static_cast<double>(frequency.QuadPart);
+#else
+    long long now = StageNow();
+    return static_cast<double>(now - startTicks) / 1000000.0;
+#endif
+}
+
+// Log one native stage. Memory figures are sampled at the end of the stage.
+static void LogStage(const char* stage, double milliseconds) {
+    ProcessMemorySample memory = SampleProcessMemory();
+    fprintf(stderr,
+        "[TinyEXR] stage=%s ms=%.3f private_bytes=%llu working_set=%llu peak_working_set=%llu\n",
+        stage,
+        milliseconds,
+        memory.privateBytes,
+        memory.workingSetBytes,
+        memory.peakWorkingSetBytes);
+    fflush(stderr);
+}
+
+// Touch each mapped page so file-read time is not mixed into decompression.
+static void PrefetchMappedFile(const unsigned char* data, size_t size) {
+    if (!data || size == 0) {
+        return;
+    }
+
+    size_t pageSize = 4096;
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    if (info.dwPageSize > 0) {
+        pageSize = static_cast<size_t>(info.dwPageSize);
+    }
+#endif
+
+    // Keep the read live so the compiler cannot delete the scan.
+    volatile unsigned char sink = 0;
+    for (size_t offset = 0; offset < size; offset += pageSize) {
+        sink = data[offset];
+    }
+    sink = data[size - 1];
+    (void)sink;
+}
+
+// Byte count of an RGBA float image, or 0 when the product would overflow.
+static size_t RgbaFloatBytes(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return 0;
+    }
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    if (w > (std::numeric_limits<size_t>::max() / 4) / sizeof(float) / h) {
+        return 0;
+    }
+    return w * h * 4 * sizeof(float);
+}
+
+// Fill one output row range with the original scalar bilinear kernel.
+static void ResizeBilinearRows(
+    const float* srcData,
+    int srcWidth,
+    int srcHeight,
+    float* dstData,
+    int targetWidth,
+    int targetHeight,
+    int channels,
+    int yBegin,
+    int yEnd
+) {
+    // Ratios match the previous full-image loop so weights stay bit-identical.
+    const float xRatio = static_cast<float>(srcWidth) / targetWidth;
+    const float yRatio = static_cast<float>(srcHeight) / targetHeight;
+
+    for (int y = yBegin; y < yEnd; y++) {
         for (int x = 0; x < targetWidth; x++) {
             float srcX = x * xRatio;
             float srcY = y * yRatio;
-            
+
             int x0 = static_cast<int>(srcX);
             int y0 = static_cast<int>(srcY);
             int x1 = std::min(x0 + 1, srcWidth - 1);
             int y1 = std::min(y0 + 1, srcHeight - 1);
-            
+
             float xWeight = srcX - x0;
             float yWeight = srcY - y0;
-            
+
             for (int c = 0; c < channels; c++) {
                 float p00 = srcData[(y0 * srcWidth + x0) * channels + c];
                 float p10 = srcData[(y0 * srcWidth + x1) * channels + c];
                 float p01 = srcData[(y1 * srcWidth + x0) * channels + c];
                 float p11 = srcData[(y1 * srcWidth + x1) * channels + c];
-                
+
                 float top = p00 * (1.0f - xWeight) + p10 * xWeight;
                 float bottom = p01 * (1.0f - xWeight) + p11 * xWeight;
-                
-                dstData[(y * targetWidth + x) * channels + c] = top * (1.0f - yWeight) + bottom * yWeight;
+
+                dstData[(y * targetWidth + x) * channels + c] =
+                    top * (1.0f - yWeight) + bottom * yWeight;
             }
         }
     }
-    
-    return dstData;
+}
+
+// Resize the whole image on the calling thread into a caller-owned buffer.
+static void ResizeBilinearInto(
+    const float* srcData,
+    int srcWidth,
+    int srcHeight,
+    float* dstData,
+    int targetWidth,
+    int targetHeight,
+    int channels
+) {
+    ResizeBilinearRows(
+        srcData, srcWidth, srcHeight,
+        dstData, targetWidth, targetHeight,
+        channels, 0, targetHeight);
 }
 
 // Helper: Extract layer names from channels
@@ -641,7 +802,172 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRLayerInfo(
     return TINYEXR_SUCCESS;
 }
 
+// Copy decoded planes into malloc'd RGBA. Matches LoadEXR() channel order.
+static int InterleaveDecodedToRgba(
+    const EXRHeader& header,
+    const EXRImage& image,
+    float** outRgba,
+    int* outWidth,
+    int* outHeight,
+    double* outAllocMs,
+    const char** err
+) {
+    *outRgba = nullptr;
+    *outAllocMs = 0.0;
+
+    int idxR = -1;
+    int idxG = -1;
+    int idxB = -1;
+    int idxA = -1;
+    int idxY = -1;
+    int idxRY = -1;
+    int idxBY = -1;
+
+    std::vector<tinyexr::LayerChannel> channels;
+    tinyexr::ChannelsInLayer(header, "", channels);
+    if (channels.size() < 1) {
+        tinyexr::SetErrorMessage(
+            "Layer Not Found. Seems EXR contains channels with layer(e.g. `diffuse.R`). if you are using LoadEXR(), please try LoadEXRWithLayer(). LoadEXR() cannot load EXR having channels with layer.",
+            err);
+        return TINYEXR_ERROR_LAYER_NOT_FOUND;
+    }
+
+    for (size_t c = 0; c < channels.size(); c++) {
+        const tinyexr::LayerChannel& ch = channels[c];
+        if (ch.name == "R") idxR = int(ch.index);
+        else if (ch.name == "G") idxG = int(ch.index);
+        else if (ch.name == "B") idxB = int(ch.index);
+        else if (ch.name == "A") idxA = int(ch.index);
+        else if (ch.name == "Y") idxY = int(ch.index);
+        else if (ch.name == "RY") idxRY = int(ch.index);
+        else if (ch.name == "BY") idxBY = int(ch.index);
+    }
+
+    // YCA conversion allocates its own RGBA buffer.
+    if (tinyexr::IsLuminanceChromaLayout(channels)) {
+        if (!tinyexr::ConvertYCAToRGBA(header, image, idxY, idxRY, idxBY, idxA, outRgba, err)) {
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+        *outWidth = image.width;
+        *outHeight = image.height;
+        return TINYEXR_SUCCESS;
+    }
+
+    const size_t rgbaBytes = RgbaFloatBytes(image.width, image.height);
+    if (rgbaBytes == 0) {
+        tinyexr::SetErrorMessage("Image dimensions are too large to allocate", err);
+        return TINYEXR_ERROR_DATA_TOO_LARGE;
+    }
+
+    long long allocStart = StageNow();
+    float* rgba = static_cast<float*>(malloc(rgbaBytes));
+    *outAllocMs = StageElapsedMs(allocStart);
+    if (!rgba) {
+        tinyexr::SetErrorMessage("Failed to allocate interleaved RGBA buffer", err);
+        return TINYEXR_ERROR_INVALID_DATA;
+    }
+
+    if (channels.size() == 1) {
+        int chIdx = int(channels.front().index);
+        if (header.tiled) {
+            const size_t tileSizeX = static_cast<size_t>(header.tile_size_x);
+            const size_t tileSizeY = static_cast<size_t>(header.tile_size_y);
+            for (int it = 0; it < image.num_tiles; it++) {
+                for (size_t j = 0; j < tileSizeY; j++) {
+                    for (size_t i = 0; i < tileSizeX; i++) {
+                        const size_t ii = static_cast<size_t>(image.tiles[it].offset_x) * tileSizeX + i;
+                        const size_t jj = static_cast<size_t>(image.tiles[it].offset_y) * tileSizeY + j;
+                        if (ii >= static_cast<size_t>(image.width) || jj >= static_cast<size_t>(image.height)) {
+                            continue;
+                        }
+                        const size_t idx = ii + jj * static_cast<size_t>(image.width);
+                        const size_t srcIdx = i + j * tileSizeX;
+                        unsigned char** src = image.tiles[it].images;
+                        const float val = reinterpret_cast<float**>(src)[chIdx][srcIdx];
+                        rgba[4 * idx + 0] = val;
+                        rgba[4 * idx + 1] = val;
+                        rgba[4 * idx + 2] = val;
+                        rgba[4 * idx + 3] = val;
+                    }
+                }
+            }
+        } else {
+            const size_t pixelCount = static_cast<size_t>(image.width) * static_cast<size_t>(image.height);
+            for (size_t i = 0; i < pixelCount; i++) {
+                const float val = reinterpret_cast<float**>(image.images)[chIdx][i];
+                rgba[4 * i + 0] = val;
+                rgba[4 * i + 1] = val;
+                rgba[4 * i + 2] = val;
+                rgba[4 * i + 3] = val;
+            }
+        }
+    } else {
+        if (idxR == -1 || idxG == -1 || idxB == -1) {
+            free(rgba);
+            const char* missing = "R channel not found";
+            if (idxR != -1 && idxG == -1) missing = "G channel not found";
+            if (idxR != -1 && idxG != -1 && idxB == -1) missing = "B channel not found";
+            tinyexr::SetErrorMessage(missing, err);
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+
+        if (header.tiled) {
+            const size_t tileSizeX = static_cast<size_t>(header.tile_size_x);
+            const size_t tileSizeY = static_cast<size_t>(header.tile_size_y);
+            for (int it = 0; it < image.num_tiles; it++) {
+                for (size_t j = 0; j < tileSizeY; j++) {
+                    for (size_t i = 0; i < tileSizeX; i++) {
+                        const size_t ii = static_cast<size_t>(image.tiles[it].offset_x) * tileSizeX + i;
+                        const size_t jj = static_cast<size_t>(image.tiles[it].offset_y) * tileSizeY + j;
+                        if (ii >= static_cast<size_t>(image.width) || jj >= static_cast<size_t>(image.height)) {
+                            continue;
+                        }
+                        const size_t idx = ii + jj * static_cast<size_t>(image.width);
+                        const size_t srcIdx = i + j * tileSizeX;
+                        unsigned char** src = image.tiles[it].images;
+                        rgba[4 * idx + 0] = reinterpret_cast<float**>(src)[idxR][srcIdx];
+                        rgba[4 * idx + 1] = reinterpret_cast<float**>(src)[idxG][srcIdx];
+                        rgba[4 * idx + 2] = reinterpret_cast<float**>(src)[idxB][srcIdx];
+                        rgba[4 * idx + 3] = (idxA != -1)
+                            ? reinterpret_cast<float**>(src)[idxA][srcIdx]
+                            : 1.0f;
+                    }
+                }
+            }
+        } else {
+            const size_t pixelCount = static_cast<size_t>(image.width) * static_cast<size_t>(image.height);
+            float** planes = reinterpret_cast<float**>(image.images);
+            float* rowR = planes[idxR];
+            float* rowG = planes[idxG];
+            float* rowB = planes[idxB];
+            float* rowA = (idxA != -1) ? planes[idxA] : nullptr;
+            for (size_t i = 0; i < pixelCount; i++) {
+                rgba[4 * i + 0] = rowR[i];
+                rgba[4 * i + 1] = rowG[i];
+                rgba[4 * i + 2] = rowB[i];
+                rgba[4 * i + 3] = rowA ? rowA[i] : 1.0f;
+            }
+        }
+    }
+
+    *outRgba = rgba;
+    *outWidth = image.width;
+    *outHeight = image.height;
+    return TINYEXR_SUCCESS;
+}
+
+// Copy a TinyEXR error into a Unity-owned string and release the source.
+static void PublishError(const char* fallback, const char* tinyErr, char** outErrorMsg) {
+    if (outErrorMsg) {
+        *outErrorMsg = DuplicateString((tinyErr && tinyErr[0]) ? tinyErr : fallback);
+    }
+    if (tinyErr) {
+        FreeEXRErrorMessage(tinyErr);
+    }
+}
+
 // Load EXR with resize
+// public API
 UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
     const char* filename,
     int targetWidth,
@@ -658,6 +984,12 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
         return TINYEXR_ERROR_INVALID_ARGUMENT;
     }
 
+    // Clear outputs so a failed call never leaves a dangling pointer.
+    *outData = nullptr;
+    if (outErrorMsg) {
+        *outErrorMsg = nullptr;
+    }
+
     if (targetWidth <= 0 || targetHeight <= 0) {
         if (outErrorMsg) {
             *outErrorMsg = DuplicateString("Invalid target dimensions");
@@ -665,56 +997,162 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
         return TINYEXR_ERROR_INVALID_ARGUMENT;
     }
 
+    const long long totalStart = StageNow();
+    double allocMs = 0.0;
     float* rgba = nullptr;
+    float* resizedData = nullptr;
     int width = 0;
     int height = 0;
     const char* err = nullptr;
 
-    int ret = LoadEXR(&rgba, &width, &height, filename, &err);
+    EXRHeader exrHeader;
+    EXRImage exrImage;
+    InitEXRHeader(&exrHeader);
+    InitEXRImage(&exrImage);
 
-    if (ret != TINYEXR_SUCCESS) {
-        if (outErrorMsg) {
-            *outErrorMsg = DuplicateString(err ? err : "Unknown error loading EXR");
+    // Map once. The map ends before interleave so its pages are not held
+    // together with the full-resolution RGBA buffer.
+    {
+        long long stageStart = StageNow();
+        MemoryMappedFile mapped(filename);
+        LogStage("file_map", StageElapsedMs(stageStart));
+        if (!mapped.valid() || mapped.data == nullptr || mapped.size < 16) {
+            PublishError("Cannot read file", nullptr, outErrorMsg);
+            FreeEXRHeader(&exrHeader);
+            return TINYEXR_ERROR_CANT_OPEN_FILE;
         }
-        if (err) FreeEXRErrorMessage(err);
+
+        stageStart = StageNow();
+        PrefetchMappedFile(mapped.data, mapped.size);
+        LogStage("file_read", StageElapsedMs(stageStart));
+
+        stageStart = StageNow();
+        EXRVersion exrVersion;
+        int ret = ParseEXRVersionFromMemory(&exrVersion, mapped.data, mapped.size);
+        if (ret != TINYEXR_SUCCESS) {
+            LogStage("header_parse", StageElapsedMs(stageStart));
+            PublishError("Failed to open EXR file or read version info from EXR file.", nullptr, outErrorMsg);
+            FreeEXRHeader(&exrHeader);
+            return ret;
+        }
+        if (exrVersion.multipart || exrVersion.non_image) {
+            LogStage("header_parse", StageElapsedMs(stageStart));
+            PublishError("Loading multipart or DeepImage is not supported  in LoadEXR() API", nullptr, outErrorMsg);
+            FreeEXRHeader(&exrHeader);
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+
+        ret = ParseEXRHeaderFromMemory(&exrHeader, &exrVersion, mapped.data, mapped.size, &err);
+        LogStage("header_parse", StageElapsedMs(stageStart));
+        if (ret != TINYEXR_SUCCESS) {
+            PublishError("Failed to parse header", err, outErrorMsg);
+            FreeEXRHeader(&exrHeader);
+            return ret;
+        }
+
+        // Read HALF channels as FLOAT, same as LoadEXR().
+        for (int i = 0; i < exrHeader.num_channels; i++) {
+            if (exrHeader.pixel_types[i] == TINYEXR_PIXELTYPE_HALF) {
+                exrHeader.requested_pixel_types[i] = TINYEXR_PIXELTYPE_FLOAT;
+            }
+        }
+
+        stageStart = StageNow();
+        fprintf(stderr, "[TinyEXR] decode_threads=%u\n",
+            std::thread::hardware_concurrency());
+        ret = LoadEXRImageFromMemory(&exrImage, &exrHeader, mapped.data, mapped.size, &err);
+        LogStage("decompress", StageElapsedMs(stageStart));
+        if (ret != TINYEXR_SUCCESS) {
+            PublishError("Unknown error loading EXR", err, outErrorMsg);
+            FreeEXRHeader(&exrHeader);
+            FreeEXRImage(&exrImage);
+            return ret;
+        }
+    }
+
+    double interleaveAllocMs = 0.0;
+    long long stageStart = StageNow();
+    int ret = InterleaveDecodedToRgba(
+        exrHeader, exrImage, &rgba, &width, &height, &interleaveAllocMs, &err);
+    const double interleaveMs = StageElapsedMs(stageStart) - interleaveAllocMs;
+    allocMs += interleaveAllocMs;
+    LogStage("alloc_interleaved", interleaveAllocMs);
+    LogStage("interleave", interleaveMs < 0.0 ? 0.0 : interleaveMs);
+    FreeEXRHeader(&exrHeader);
+    FreeEXRImage(&exrImage);
+    if (ret != TINYEXR_SUCCESS) {
+        PublishError("Unknown error loading EXR", err, outErrorMsg);
         return ret;
     }
 
-    // Resize if needed
-    float* resizedData = rgba;
+    resizedData = rgba;
     if (width != targetWidth || height != targetHeight) {
-        resizedData = ResizeBilinear(rgba, width, height, targetWidth, targetHeight, 4);
+        const size_t dstBytes = RgbaFloatBytes(targetWidth, targetHeight);
+        stageStart = StageNow();
+        resizedData = (dstBytes == 0) ? nullptr : static_cast<float*>(malloc(dstBytes));
+        const double resizeAllocMs = StageElapsedMs(stageStart);
+        allocMs += resizeAllocMs;
+        LogStage("alloc_resize", resizeAllocMs);
+        if (!resizedData) {
+            free(rgba);
+            PublishError("Failed to allocate resized image", nullptr, outErrorMsg);
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+
+        stageStart = StageNow();
+        ResizeBilinearInto(rgba, width, height, resizedData, targetWidth, targetHeight, 4);
+        LogStage("resize", StageElapsedMs(stageStart));
         free(rgba);
         rgba = nullptr;
+    } else {
+        LogStage("alloc_resize", 0.0);
+        LogStage("resize", 0.0);
     }
 
-    // Apply gamma correction
+    stageStart = StageNow();
     if (options->gammaCorrection != 1.0f) {
         ApplyGamma(resizedData, targetWidth, targetHeight, 4, options->gammaCorrection);
     }
+    LogStage("gamma", StageElapsedMs(stageStart));
 
-    // Flip vertically for Unity
+    stageStart = StageNow();
     if (options->flipY) {
         FlipVertical(resizedData, targetWidth, targetHeight, 4);
     }
+    LogStage("flip", StageElapsedMs(stageStart));
 
-    // Handle channel conversion
+    // Strip alpha after color conversion so gamma and flip still see RGBA.
     if (options->targetChannels == 3) {
-        float* rgb = new float[targetWidth * targetHeight * 3];
-        for (int i = 0; i < targetWidth * targetHeight; i++) {
+        const size_t pixelCount = static_cast<size_t>(targetWidth) * static_cast<size_t>(targetHeight);
+        if (pixelCount > (std::numeric_limits<size_t>::max() / 3) / sizeof(float)) {
+            free(resizedData);
+            PublishError("Image dimensions are too large to allocate", nullptr, outErrorMsg);
+            return TINYEXR_ERROR_DATA_TOO_LARGE;
+        }
+        stageStart = StageNow();
+        float* rgb = static_cast<float*>(malloc(pixelCount * 3 * sizeof(float)));
+        const double channelAllocMs = StageElapsedMs(stageStart);
+        allocMs += channelAllocMs;
+        LogStage("alloc_channels", channelAllocMs);
+        if (!rgb) {
+            free(resizedData);
+            PublishError("Failed to allocate RGB buffer", nullptr, outErrorMsg);
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+        stageStart = StageNow();
+        for (size_t i = 0; i < pixelCount; i++) {
             rgb[i * 3 + 0] = resizedData[i * 4 + 0];
             rgb[i * 3 + 1] = resizedData[i * 4 + 1];
             rgb[i * 3 + 2] = resizedData[i * 4 + 2];
         }
-        if (rgba != nullptr) {
-            free(resizedData);
-        } else {
-            delete[] resizedData;
-        }
+        LogStage("channel_convert", StageElapsedMs(stageStart));
+        free(resizedData);
         resizedData = rgb;
         outInfo->numChannels = 3;
         outInfo->hasAlpha = 0;
     } else {
+        LogStage("alloc_channels", 0.0);
+        LogStage("channel_convert", 0.0);
         outInfo->numChannels = 4;
         outInfo->hasAlpha = 1;
     }
@@ -722,9 +1160,10 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
     outInfo->width = targetWidth;
     outInfo->height = targetHeight;
     outInfo->pixelType = 2; // FLOAT
-
     *outData = resizedData;
-    if (outErrorMsg) *outErrorMsg = nullptr;
+
+    LogStage("alloc", allocMs);
+    LogStage("total", StageElapsedMs(totalStart));
     return TINYEXR_SUCCESS;
 }
 
