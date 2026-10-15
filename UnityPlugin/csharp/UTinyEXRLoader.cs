@@ -1,7 +1,9 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 
 namespace TinyEXR
@@ -208,29 +210,9 @@ namespace TinyEXR
         /// </summary>
         private static Texture2D LoadEXRWithOptions(string filePath, ConversionOptions options)
         {
-            ValidateFilePath(filePath);
-
-            IntPtr dataPtr = IntPtr.Zero;
-            IntPtr errorPtr = IntPtr.Zero;
-
-            try
-            {
-                ImageInfo info;
-                int result = LoadEXRWithOptionsForUnity(filePath, out dataPtr, out info, ref options, out errorPtr);
-
-                if (result != 0)
-                {
-                    string errorMsg = GetErrorMessage(errorPtr);
-                    throw new Exception($"Failed to load EXR: {errorMsg}");
-                }
-
-                return CreateTexture(dataPtr, info, options.gammaCorrection == 1.0f);
-            }
-            finally
-            {
-                if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
-                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
-            }
+            // Keep decoded pixels native until Unity has copied them into its texture storage.
+            using (var native = LoadEXRRawNative(filePath, options))
+                return CreateTextureFromNative(native, options.gammaCorrection == 1.0f);
         }
 
         /// <summary>
@@ -248,13 +230,101 @@ namespace TinyEXR
         /// </summary>
         public static Texture2D LoadEXRWithResize(string filePath, int width, int height, ConversionOptions options)
         {
-            var raw = LoadEXRWithResizeRaw(filePath, width, height, options);
-            return CreateTextureFromRaw(raw, options.gammaCorrection == 1.0f);
+            // Keep decoded pixels native until Unity has copied them into its texture storage.
+            using (var native = LoadEXRWithResizeNative(filePath, width, height, options))
+                return CreateTextureFromNative(native, options.gammaCorrection == 1.0f);
+        }
+
+        /// <summary>
+        /// Load and resize EXR pixels into an owned native buffer. Safe to call from any thread.
+        /// The caller must dispose the returned buffer.
+        /// </summary>
+        // public API - add this line before public API methods
+        public static NativeExrBuffer LoadEXRWithResizeNative(
+            string filePath, int width, int height, ConversionOptions options)
+        {
+            ValidateFilePath(filePath);
+            ValidateDimensions(width, height);
+
+            // Transfer the native allocation only after all result validation succeeds.
+            IntPtr dataPtr = IntPtr.Zero;
+            IntPtr errorPtr = IntPtr.Zero;
+            var decodeTimer = Stopwatch.StartNew();
+            try
+            {
+                ImageInfo info;
+                int result = LoadEXRWithResizeForUnity(
+                    filePath, width, height, out dataPtr, out info, ref options, out errorPtr);
+                decodeTimer.Stop();
+                if (result != 0)
+                {
+                    string errorMsg = GetErrorMessage(errorPtr);
+                    throw new Exception($"Failed to load EXR with resize: {errorMsg}");
+                }
+
+                ValidateDecodedImage(info);
+                var native = new NativeExrBuffer(dataPtr, info);
+                dataPtr = IntPtr.Zero;
+                LogExrTiming(
+                    "native resize decode",
+                    decodeTimer.Elapsed.TotalMilliseconds,
+                    $"{Path.GetFileName(filePath)} -> {native.Width}x{native.Height}, {FormatMegabytes(native.ByteCount)}");
+                return native;
+            }
+            finally
+            {
+                // A non-zero pointer here means ownership was not transferred to NativeExrBuffer.
+                if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
+                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+            }
+        }
+
+        /// <summary>
+        /// Load full-size EXR pixels into an owned native buffer. Safe to call from any thread.
+        /// The caller must dispose the returned buffer.
+        /// </summary>
+        // public API - add this line before public API methods
+        public static NativeExrBuffer LoadEXRRawNative(string filePath, ConversionOptions options)
+        {
+            ValidateFilePath(filePath);
+
+            // Transfer the native allocation only after all result validation succeeds.
+            IntPtr dataPtr = IntPtr.Zero;
+            IntPtr errorPtr = IntPtr.Zero;
+            var decodeTimer = Stopwatch.StartNew();
+            try
+            {
+                ImageInfo info;
+                int result = LoadEXRWithOptionsForUnity(
+                    filePath, out dataPtr, out info, ref options, out errorPtr);
+                decodeTimer.Stop();
+                if (result != 0)
+                {
+                    string errorMsg = GetErrorMessage(errorPtr);
+                    throw new Exception($"Failed to load EXR: {errorMsg}");
+                }
+
+                ValidateDecodedImage(info);
+                var native = new NativeExrBuffer(dataPtr, info);
+                dataPtr = IntPtr.Zero;
+                LogExrTiming(
+                    "native decode",
+                    decodeTimer.Elapsed.TotalMilliseconds,
+                    $"{Path.GetFileName(filePath)} {native.Width}x{native.Height}, {FormatMegabytes(native.ByteCount)}");
+                return native;
+            }
+            finally
+            {
+                // A non-zero pointer here means ownership was not transferred to NativeExrBuffer.
+                if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
+                if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
+            }
         }
 
         /// <summary>
         /// Load and resize EXR into managed pixel bytes. Safe to call from any thread.
         /// </summary>
+        [Obsolete("Use LoadEXRWithResizeNative to avoid the managed pixel copy.")]
         public static ExrRawImageData LoadEXRWithResizeRaw(string filePath, int width, int height, ConversionOptions options)
         {
             ValidateFilePath(filePath);
@@ -277,25 +347,17 @@ namespace TinyEXR
 
                 return CopyNativeToRaw(dataPtr, info);
             }
-            catch (Exception ex)
-            { 
-                
-                Debug.LogError($"{ex.Message}");
-                throw new InvalidOperationException();
-            }
-            
             finally
             {
                 if (dataPtr != IntPtr.Zero) FreeImageData(dataPtr);
                 if (errorPtr != IntPtr.Zero) FreeErrorMessage(errorPtr);
             }
-
-           
         }
 
         /// <summary>
         /// Load full-size EXR into managed pixel bytes. Safe to call from any thread.
         /// </summary>
+        [Obsolete("Use LoadEXRRawNative to avoid the managed pixel copy.")]
         public static ExrRawImageData LoadEXRRaw(string filePath, ConversionOptions options)
         {
             ValidateFilePath(filePath);
@@ -326,6 +388,7 @@ namespace TinyEXR
         /// <summary>
         /// Create a Texture2D from raw EXR pixel data. Must be called on the Unity main thread.
         /// </summary>
+        [Obsolete("Use CreateTextureFromNative to avoid the managed pixel copy.")]
         public static Texture2D CreateTextureFromRaw(ExrRawImageData raw, bool linear)
         {
             if (raw == null)
@@ -352,10 +415,31 @@ namespace TinyEXR
         }
 
         /// <summary>
+        /// Upload an owned native EXR buffer into a Texture2D. Must be called on the Unity main thread.
+        /// The caller remains responsible for disposing the buffer.
+        /// </summary>
+        // public API - add this line before public API methods
+        public static Texture2D CreateTextureFromNative(NativeExrBuffer buffer, bool linear)
+        {
+            if (buffer == null)
+                throw new ArgumentNullException(nameof(buffer));
+
+            // Validate metadata before Unity allocates the destination texture.
+            ValidateDecodedImage(buffer.Info);
+            return CreateTextureFromPointer(
+                buffer.DataPointer,
+                buffer.ByteCount,
+                buffer.Width,
+                buffer.Height,
+                buffer.NumChannels,
+                linear);
+        }
+
+        /// <summary>
         /// Load EXR file with resize asynchronously (Unity-friendly).
         /// Intended for callers already on the main thread.
-        /// If the caller runs on a background thread, use LoadEXRWithResizeRaw and CreateTextureFromRaw
-        /// after switching to the main thread instead.
+        /// If the caller runs on a background thread, use LoadEXRWithResizeNative and
+        /// CreateTextureFromNative after switching to the main thread instead.
         /// </summary>
         public static async System.Threading.Tasks.Task<Texture2D> LoadEXRAsync(string filePath, int width, int height, bool linear = true)
         {
@@ -366,16 +450,17 @@ namespace TinyEXR
         /// <summary>
         /// Load EXR file with resize and custom options asynchronously (Unity-friendly).
         /// Intended for callers already on the main thread.
-        /// If the caller runs on a background thread, use LoadEXRWithResizeRaw and CreateTextureFromRaw
-        /// after switching to the main thread instead.
+        /// If the caller runs on a background thread, use LoadEXRWithResizeNative and
+        /// CreateTextureFromNative after switching to the main thread instead.
         /// </summary>
         public static async System.Threading.Tasks.Task<Texture2D> LoadEXRWithResizeAsync(string filePath, int width, int height, ConversionOptions options)
         {
             // Decode and resize on a worker thread; resume on the caller context so texture upload stays on main thread.
-            var raw = await System.Threading.Tasks.Task.Run(() =>
-                LoadEXRWithResizeRaw(filePath, width, height, options)).ConfigureAwait(true);
-
-            return CreateTextureFromRaw(raw, options.gammaCorrection == 1.0f);
+            using (var native = await System.Threading.Tasks.Task.Run(() =>
+                       LoadEXRWithResizeNative(filePath, width, height, options)).ConfigureAwait(true))
+            {
+                return CreateTextureFromNative(native, options.gammaCorrection == 1.0f);
+            }
         }
 
         /// <summary>
@@ -586,12 +671,32 @@ namespace TinyEXR
                 throw new NotSupportedException($"Unsupported EXR channel count: {numChannels}. Expected 1-4 channels.");
         }
 
+        private static void ValidateDecodedImage(ImageInfo info)
+        {
+            // Texture upload currently targets RGBAFloat, so the native output must be RGBA.
+            if (info.width <= 0 || info.height <= 0)
+                throw new InvalidOperationException($"Invalid decoded EXR dimensions: {info.width}x{info.height}.");
+
+            ValidateChannelCount(info.numChannels);
+            if (info.numChannels != 4)
+            {
+                throw new NotSupportedException(
+                    $"RGBAFloat upload requires 4 channels, got {info.numChannels}.");
+            }
+
+            checked
+            {
+                _ = (long)info.width * info.height * info.numChannels * sizeof(float);
+            }
+        }
+
         private static Texture2D CreateTexture(IntPtr dataPtr, ImageInfo info, bool linear)
         {
-            ValidateChannelCount(info.numChannels);
-            return CreateTextureFromBytes(
+            ValidateDecodedImage(info);
+            long byteCount = checked((long)info.width * info.height * info.numChannels * sizeof(float));
+            return CreateTextureFromPointer(
                 dataPtr,
-                info.width * info.height * info.numChannels * sizeof(float),
+                byteCount,
                 info.width,
                 info.height,
                 info.numChannels,
@@ -637,13 +742,113 @@ namespace TinyEXR
             }
         }
 
-        private static Texture2D CreateTextureFromBytes(
-            IntPtr dataPtr, int byteCount, int width, int height, int numChannels, bool linear)
+        private static Texture2D CreateTextureFromPointer(
+            IntPtr dataPtr, long byteCount, int width, int height, int numChannels, bool linear)
         {
+            if (dataPtr == IntPtr.Zero)
+                throw new ArgumentException("Native EXR data pointer cannot be zero.", nameof(dataPtr));
+            if (numChannels != 4)
+                throw new NotSupportedException($"RGBAFloat upload requires 4 channels, got {numChannels}.");
+
+            var stageTimer = Stopwatch.StartNew();
             var texture = new Texture2D(width, height, TextureFormat.RGBAFloat, false, linear);
-            texture.LoadRawTextureData(dataPtr, byteCount);
-            texture.Apply();
-            return texture;
+            double allocateMs = stageTimer.Elapsed.TotalMilliseconds;
+
+            try
+            {
+                stageTimer.Restart();
+                string uploadPath;
+                if (byteCount <= int.MaxValue)
+                {
+                    // Unity can copy sub-2 GiB payloads directly from the native allocation.
+                    texture.LoadRawTextureData(dataPtr, checked((int)byteCount));
+                    uploadPath = "LoadRawTextureData";
+                }
+                else
+                {
+                    // Unity's direct upload takes an int byte count; copy larger payloads in safe slices.
+                    CopyLargeNativeBufferToTexture(dataPtr, byteCount, texture);
+                    uploadPath = "sliced NativeArray copy";
+                }
+
+                double cpuUploadMs = stageTimer.Elapsed.TotalMilliseconds;
+                stageTimer.Restart();
+                texture.Apply();
+                double applyMs = stageTimer.Elapsed.TotalMilliseconds;
+                LogExrTiming(
+                    "texture upload",
+                    allocateMs + cpuUploadMs + applyMs,
+                    $"{width}x{height} {FormatMegabytes(byteCount)} via {uploadPath}; " +
+                    $"allocate {allocateMs:0.0} ms, cpu copy {cpuUploadMs:0.0} ms, Apply {applyMs:0.0} ms");
+                return texture;
+            }
+            catch
+            {
+                UnityEngine.Object.Destroy(texture);
+                throw;
+            }
+        }
+
+        private static unsafe void CopyLargeNativeBufferToTexture(
+            IntPtr dataPtr, long byteCount, Texture2D texture)
+        {
+            long floatCount = checked(byteCount / sizeof(float));
+            if (byteCount % sizeof(float) != 0 || floatCount > int.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    $"EXR payload cannot be represented as a Unity NativeArray: {byteCount} bytes.");
+            }
+
+            // Wrap the plugin allocation without taking ownership; NativeExrBuffer frees it after upload.
+            var source = NativeArrayUnsafeUtility.ConvertExistingDataToNativeArray<float>(
+                dataPtr.ToPointer(), checked((int)floatCount), Allocator.None);
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+            var safety = AtomicSafetyHandle.Create();
+            NativeArrayUnsafeUtility.SetAtomicSafetyHandle(ref source, safety);
+#endif
+            try
+            {
+                var destination = texture.GetPixelData<float>(0);
+                if (destination.Length != source.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"Texture float buffer is {destination.Length}, EXR has {source.Length}.");
+                }
+
+                // Keep each memcpy comfortably below APIs that internally use signed byte counts.
+                const int floatsPerSlice = 32 * 1024 * 1024;
+                int offset = 0;
+                while (offset < source.Length)
+                {
+                    int count = Math.Min(floatsPerSlice, source.Length - offset);
+                    NativeArray<float>.Copy(source, offset, destination, offset, count);
+                    offset += count;
+                }
+            }
+            finally
+            {
+#if ENABLE_UNITY_COLLECTIONS_CHECKS
+                AtomicSafetyHandle.Release(safety);
+#endif
+            }
+        }
+
+        internal static void ReleaseImageData(IntPtr dataPointer)
+        {
+            // NativeExrBuffer is the sole owner when this method is called.
+            if (dataPointer != IntPtr.Zero)
+                FreeImageData(dataPointer);
+        }
+
+        private static void LogExrTiming(string stage, double elapsedMs, string detail)
+        {
+            // One searchable prefix so decode and upload can be compared in the Console.
+            UnityEngine.Debug.Log($"[EXR timing] {stage}: {elapsedMs:0.0} ms | {detail}");
+        }
+
+        private static string FormatMegabytes(long byteCount)
+        {
+            return $"{byteCount / (1024d * 1024d):0.0} MB";
         }
 
         private static string GetErrorMessage(IntPtr errorPtr)

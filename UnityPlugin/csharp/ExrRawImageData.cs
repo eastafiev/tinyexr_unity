@@ -10,9 +10,9 @@ namespace TinyEXR
         public int NumChannels { get; set; }
 
         /// <summary>
-        /// Tightly packed float pixels. One float[] stays under the runtime array
-        /// limit for images whose byte size is 2 GiB or larger (16384x8192 RGBA float).
+        /// Tightly packed managed float pixels retained for compatibility.
+        /// Prefer NativeExrBuffer for texture upload to avoid the native-to-managed copy.
         /// </summary>
-        public float[] Data { get; set; } // Maybe it worth to use NativeArray[float], cause further we copy float[] into it.
+        public float[] Data { get; set; }
     }
 }
