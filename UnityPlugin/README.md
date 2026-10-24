@@ -230,6 +230,20 @@ build.bat   # Windows
 
 3. The plugin will be in `build/bin/`
 
+### Threading and resize bench
+
+`UnityTinyEXR.dll` is built with `TINYEXR_USE_THREAD=1`. ZIP and tile decode for load, options, layer, and resize uses TinyEXR's worker pool. Options, layer, and resize map the file once and interleave into `malloc` memory; `FreeImageData` releases that buffer with `free()`. Resize stays a separate scalar bilinear pass.
+
+`exr_resize_bench` (`native/exr_resize_bench.cpp`) is a separate executable, not linked into the DLL. It is a CMake target from the repo root and from `UnityPlugin/CMakeLists.txt`. `--no-resize` calls `LoadEXRWithOptionsForUnity`. Timing notes are in the repository README under "Unity native loader".
+
+Windows, from the repo root (one command per line):
+
+```
+cmake -S . -B build -A x64
+cmake --build build --config Release --target exr_resize_bench
+build\bin\Release\exr_resize_bench.exe --warmup 1 --runs 1 --validate
+```
+
 ## License
 
 This plugin uses TinyEXR which is licensed under the 3-clause BSD license.

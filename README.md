@@ -140,6 +140,23 @@ Current status of `tinyexr` is:
 
 * [experimental/js/](experimental/js) JavaScript port using Emscripten
 
+## Unity native loader
+
+`UnityTinyEXR` (`UnityPlugin/native/unity_tinyexr_plugin.cpp`) is built with `TINYEXR_USE_THREAD=1`. `LoadEXR`, `LoadEXRWithOptions`, `LoadEXRLayer`, and `LoadEXRWithResize` decompress ZIP and tile chunks on TinyEXR's worker pool. `LoadEXRWithOptionsForUnity`, `LoadEXRLayerForUnity`, and `LoadEXRWithResizeForUnity` map the file once, then interleave into a `malloc`'d float buffer. Release that buffer with `FreeImageData` (`free`). Resize is a separate scalar bilinear pass.
+
+`exr_resize_bench` (`UnityPlugin/native/exr_resize_bench.cpp`) is its own CMake target in `CMakeLists.txt` and `UnityPlugin/CMakeLists.txt`. It is not linked into `UnityTinyEXR.dll`. The default case is `EXR_Assets/shanghai_riverside_17k.exr` to 16384x8192, `flipY=1`, `channels=4`, `gamma=1`. Flags: `--warmup`, `--runs`, `--validate`, `--no-resize`, `--width`, `--height`, `--flip`, `--channels`, `--gamma`.
+
+Windows PowerShell (run each command on its own line):
+
+```
+cmake -S . -B build -A x64
+cmake --build build --config Release --target UnityTinyEXR
+cmake --build build --config Release --target exr_resize_bench
+build\bin\Release\exr_resize_bench.exe
+```
+
+A warm resize of that default case is about 3.8s total (decompress about 1.1s), versus about 16.6s single-thread (decompress about 13.9s). `--no-resize` is about 3.6s and includes a cold-ish file read.
+
 ## Usage
 
 NOTE: **API is still subject to change**. See the source code for details.

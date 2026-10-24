@@ -145,18 +145,34 @@ else()
     set(DIST_PLATFORM_DIR "${DIST_DIR}/Plugins/Linux/x86_64")
 endif()
 set(DIST_SCRIPTS_DIR "${DIST_DIR}/Scripts/TinyEXR")
-set(CSHARP_WRAPPER "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp/TinyEXRLoader.cs")
+set(DIST_EXAMPLES_DIR "${DIST_SCRIPTS_DIR}/Examples")
+# Real loader sources. TinyEXRLoader.cs is not in the tree; the example calls UTinyEXRLoader.
+set(CSHARP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/csharp")
+set(EXAMPLE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/UnityPlugin/examples/EXRLoaderExample.cs")
 
-# Always stage DLL + C# into dist/ after build
+# Always stage DLL + C# API + sample script into dist/ after build.
+# Scripts stay source files; they are not compiled into the native plugin.
 add_custom_command(TARGET UnityTinyEXR POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_PLATFORM_DIR}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_SCRIPTS_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_EXAMPLES_DIR}"
+    # Drop the old staged name so it cannot duplicate class UTinyEXRLoader.
+    COMMAND ${CMAKE_COMMAND} -E remove -f "${DIST_SCRIPTS_DIR}/TinyEXRLoader.cs"
     COMMAND ${CMAKE_COMMAND} -E copy
         $<TARGET_FILE:UnityTinyEXR>
         "${DIST_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
     COMMAND ${CMAKE_COMMAND} -E copy
-        "${CSHARP_WRAPPER}"
-        "${DIST_SCRIPTS_DIR}/TinyEXRLoader.cs"
+        "${CSHARP_SRC_DIR}/UTinyEXRLoader.cs"
+        "${DIST_SCRIPTS_DIR}/UTinyEXRLoader.cs"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CSHARP_SRC_DIR}/NativeExrBuffer.cs"
+        "${DIST_SCRIPTS_DIR}/NativeExrBuffer.cs"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CSHARP_SRC_DIR}/ExrRawImageData.cs"
+        "${DIST_SCRIPTS_DIR}/ExrRawImageData.cs"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${EXAMPLE_SCRIPT}"
+        "${DIST_EXAMPLES_DIR}/EXRLoaderExample.cs"
     COMMENT "Staging package to: ${DIST_DIR}"
 )
 
@@ -170,16 +186,29 @@ if(UNITY_PROJECT_PATH AND EXISTS "${UNITY_PROJECT_PATH}")
         set(UNITY_PLATFORM_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
     endif()
     set(UNITY_SCRIPTS_DIR "${UNITY_PROJECT_PATH}/Assets/Scripts/TinyEXR")
+    set(UNITY_EXAMPLES_DIR "${UNITY_SCRIPTS_DIR}/Examples")
 
     add_custom_command(TARGET UnityTinyEXR POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_PLATFORM_DIR}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_SCRIPTS_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${UNITY_EXAMPLES_DIR}"
+        # Drop the old staged name so it cannot duplicate class UTinyEXRLoader.
+        COMMAND ${CMAKE_COMMAND} -E remove -f "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
         COMMAND ${CMAKE_COMMAND} -E copy
             $<TARGET_FILE:UnityTinyEXR>
             "${UNITY_PLATFORM_DIR}/$<TARGET_FILE_NAME:UnityTinyEXR>"
         COMMAND ${CMAKE_COMMAND} -E copy
-            "${CSHARP_WRAPPER}"
-            "${UNITY_SCRIPTS_DIR}/TinyEXRLoader.cs"
+            "${CSHARP_SRC_DIR}/UTinyEXRLoader.cs"
+            "${UNITY_SCRIPTS_DIR}/UTinyEXRLoader.cs"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CSHARP_SRC_DIR}/NativeExrBuffer.cs"
+            "${UNITY_SCRIPTS_DIR}/NativeExrBuffer.cs"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${CSHARP_SRC_DIR}/ExrRawImageData.cs"
+            "${UNITY_SCRIPTS_DIR}/ExrRawImageData.cs"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${EXAMPLE_SCRIPT}"
+            "${UNITY_EXAMPLES_DIR}/EXRLoaderExample.cs"
         COMMENT "Deploying to Unity: ${UNITY_PROJECT_PATH}/Assets"
     )
 
