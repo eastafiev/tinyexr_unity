@@ -1,6 +1,8 @@
 // Standalone benchmark for LoadEXRWithResizeForUnity.
 // Decodes an EXR and resizes it without Unity, and can memcmp the result
 // against LoadEXR() plus the original scalar bilinear resize.
+// --no-resize calls LoadEXRWithOptionsForUnity and compares it to LoadEXR
+// plus the same gamma, flip, and channel options.
 
 #include "unity_tinyexr_plugin.h"
 #include "../../tinyexr.h"
@@ -27,6 +29,7 @@ struct BenchOptions {
     int warmup;
     int runs;
     int validate;
+    int noResize;
     int flipY;
     int channels;
     float gamma;
@@ -135,9 +138,12 @@ static void FlipVerticalReference(float* data, int width, int height, int channe
 }
 
 // LoadEXR plus the original post-process, used only for pixel comparison.
+// --no-resize keeps the file dimensions and skips bilinear resize.
 static int LoadReference(
     const BenchOptions& options,
     float** outData,
+    int* outWidth,
+    int* outHeight,
     int* outChannels
 ) {
     float* rgba = nullptr;
@@ -153,41 +159,47 @@ static int LoadReference(
         return ret;
     }
 
-    float* resized = rgba;
-    if (width != options.width || height != options.height) {
-        resized = ResizeBilinearReference(rgba, width, height, options.width, options.height, 4);
+    int imageWidth = width;
+    int imageHeight = height;
+    float* image = rgba;
+    if (!options.noResize && (width != options.width || height != options.height)) {
+        image = ResizeBilinearReference(rgba, width, height, options.width, options.height, 4);
         free(rgba);
-        if (!resized) {
+        if (!image) {
             fprintf(stderr, "[bench] reference resize allocation failed\n");
             return TINYEXR_ERROR_INVALID_DATA;
         }
+        imageWidth = options.width;
+        imageHeight = options.height;
     }
 
-    ApplyGammaReference(resized, options.width, options.height, 4, options.gamma);
+    ApplyGammaReference(image, imageWidth, imageHeight, 4, options.gamma);
     if (options.flipY) {
-        FlipVerticalReference(resized, options.width, options.height, 4);
+        FlipVerticalReference(image, imageWidth, imageHeight, 4);
     }
 
     if (options.channels == 3) {
-        const size_t pixelCount = static_cast<size_t>(options.width) * static_cast<size_t>(options.height);
+        const size_t pixelCount = static_cast<size_t>(imageWidth) * static_cast<size_t>(imageHeight);
         float* rgb = static_cast<float*>(malloc(pixelCount * 3 * sizeof(float)));
         if (!rgb) {
-            free(resized);
+            free(image);
             return TINYEXR_ERROR_INVALID_DATA;
         }
         for (size_t i = 0; i < pixelCount; i++) {
-            rgb[i * 3 + 0] = resized[i * 4 + 0];
-            rgb[i * 3 + 1] = resized[i * 4 + 1];
-            rgb[i * 3 + 2] = resized[i * 4 + 2];
+            rgb[i * 3 + 0] = image[i * 4 + 0];
+            rgb[i * 3 + 1] = image[i * 4 + 1];
+            rgb[i * 3 + 2] = image[i * 4 + 2];
         }
-        free(resized);
-        resized = rgb;
+        free(image);
+        image = rgb;
         *outChannels = 3;
     } else {
         *outChannels = 4;
     }
 
-    *outData = resized;
+    *outWidth = imageWidth;
+    *outHeight = imageHeight;
+    *outData = image;
     return TINYEXR_SUCCESS;
 }
 
@@ -204,17 +216,29 @@ static int LoadUnderTest(
 
     char* errorMsg = nullptr;
     const double start = NowMs();
-    int ret = LoadEXRWithResizeForUnity(
-        options.filename,
-        options.width,
-        options.height,
-        outData,
-        outInfo,
-        &conversion,
-        &errorMsg);
+    int ret = 0;
+    if (options.noResize) {
+        // Full-resolution options path, compared with LoadEXR under --validate.
+        ret = LoadEXRWithOptionsForUnity(
+            options.filename,
+            outData,
+            outInfo,
+            &conversion,
+            &errorMsg);
+    } else {
+        ret = LoadEXRWithResizeForUnity(
+            options.filename,
+            options.width,
+            options.height,
+            outData,
+            outInfo,
+            &conversion,
+            &errorMsg);
+    }
     *outWallMs = NowMs() - start;
     if (ret != TINYEXR_SUCCESS) {
-        fprintf(stderr, "[bench] LoadEXRWithResizeForUnity failed: %s\n",
+        fprintf(stderr, "[bench] %s failed: %s\n",
+            options.noResize ? "LoadEXRWithOptionsForUnity" : "LoadEXRWithResizeForUnity",
             errorMsg ? errorMsg : "unknown");
     }
     if (errorMsg) {
@@ -262,9 +286,10 @@ static int CompareImages(
 static void PrintUsage() {
     fprintf(stderr,
         "Usage: exr_resize_bench [file] [--width N] [--height N] [--runs N] [--warmup N]\n"
-        "         [--validate] [--flip 0|1] [--channels 3|4] [--gamma F]\n"
+        "         [--validate] [--no-resize] [--flip 0|1] [--channels 3|4] [--gamma F]\n"
         "Default file: EXR_Assets/shanghai_riverside_17k.exr\n"
-        "Default size: 16384x8192, flipY=1, channels=4, gamma=1\n");
+        "Default size: 16384x8192, flipY=1, channels=4, gamma=1\n"
+        "--no-resize loads through LoadEXRWithOptionsForUnity at the file's size.\n");
 }
 
 static int ParseArgs(int argc, char** argv, BenchOptions* options) {
@@ -274,6 +299,7 @@ static int ParseArgs(int argc, char** argv, BenchOptions* options) {
     options->warmup = 1;
     options->runs = 1;
     options->validate = 0;
+    options->noResize = 0;
     options->flipY = 1;
     options->channels = 4;
     options->gamma = 1.0f;
@@ -286,6 +312,10 @@ static int ParseArgs(int argc, char** argv, BenchOptions* options) {
         }
         if (strcmp(arg, "--validate") == 0) {
             options->validate = 1;
+            continue;
+        }
+        if (strcmp(arg, "--no-resize") == 0) {
+            options->noResize = 1;
             continue;
         }
         if (i + 1 >= argc) {
@@ -325,9 +355,9 @@ int main(int argc, char** argv) {
         return parseResult == 1 ? 0 : parseResult;
     }
 
-    fprintf(stderr, "[bench] file=%s target=%dx%d warmup=%d runs=%d validate=%d flip=%d channels=%d gamma=%g\n",
+    fprintf(stderr, "[bench] file=%s target=%dx%d warmup=%d runs=%d validate=%d no_resize=%d flip=%d channels=%d gamma=%g\n",
         options.filename, options.width, options.height, options.warmup, options.runs,
-        options.validate, options.flipY, options.channels, options.gamma);
+        options.validate, options.noResize, options.flipY, options.channels, options.gamma);
     fprintf(stderr, "[bench] hardware_concurrency=%u\n",
         std::thread::hardware_concurrency());
 
@@ -366,16 +396,19 @@ int main(int argc, char** argv) {
 
     if (options.validate) {
         float* reference = nullptr;
+        int referenceWidth = 0;
+        int referenceHeight = 0;
         int referenceChannels = 0;
         fprintf(stderr, "[bench] reference begin\n");
         const double referenceStart = NowMs();
-        int ret = LoadReference(options, &reference, &referenceChannels);
+        int ret = LoadReference(
+            options, &reference, &referenceWidth, &referenceHeight, &referenceChannels);
         const double referenceMs = NowMs() - referenceStart;
         if (ret != 0) {
             return 1;
         }
-        fprintf(stderr, "[bench] reference wall_ms=%.3f channels=%d\n",
-            referenceMs, referenceChannels);
+        fprintf(stderr, "[bench] reference wall_ms=%.3f size=%dx%d channels=%d\n",
+            referenceMs, referenceWidth, referenceHeight, referenceChannels);
 
         float* actual = nullptr;
         UnityImageInfo info;
@@ -385,10 +418,11 @@ int main(int argc, char** argv) {
             free(reference);
             return 1;
         }
-        if (info.width != options.width || info.height != options.height ||
+        if (info.width != referenceWidth || info.height != referenceHeight ||
             info.numChannels != referenceChannels) {
-            fprintf(stderr, "[bench] validate=size mismatch actual=%dx%d ch=%d\n",
-                info.width, info.height, info.numChannels);
+            fprintf(stderr, "[bench] validate=size mismatch actual=%dx%d ch=%d ref=%dx%d ch=%d\n",
+                info.width, info.height, info.numChannels,
+                referenceWidth, referenceHeight, referenceChannels);
             free(reference);
             FreeImageData(actual);
             return 1;

@@ -1,5 +1,7 @@
-// Unity native EXR loader. LoadEXRWithResizeForUnity times each decode stage
-// and returns malloc'd pixels that FreeImageData releases with free().
+// Unity native EXR loader. Pixel loads map the EXR once, decode through
+// TinyEXR's worker pool, and return malloc'd floats that FreeImageData
+// releases with free(). The resize, options, and layer paths share that
+// decode and log each stage to stderr.
 #define TINYEXR_IMPLEMENTATION
 #define TINYEXR_USE_MINIZ 1
 // ZIP/PIZ chunks are independent. TinyEXR's worker pool decodes them in parallel.
@@ -571,6 +573,19 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRCompatibilityForUnity(
     return TINYEXR_SUCCESS;
 }
 
+// Copy a TinyEXR error into a Unity-owned string. Defined with the decode helpers.
+static void PublishError(const char* fallback, const char* tinyErr, char** outErrorMsg);
+
+// Single-map decode plus interleave. Defined with the other decode helpers.
+static int LoadMappedInterleavedRgba(
+    const char* filename,
+    const char* layerName,
+    float** outRgba,
+    int* outWidth,
+    int* outHeight,
+    double* outInterleaveAllocMs,
+    char** outErrorMsg);
+
 // Load EXR with default options
 UNITY_TINYEXR_API int UNITY_CALL LoadEXRForUnity(
     const char* filename,
@@ -601,44 +616,67 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithOptionsForUnity(
         return TINYEXR_ERROR_INVALID_ARGUMENT;
     }
 
+    // A failed call must not leave a previous pointer for the caller to free.
+    *outData = nullptr;
+    if (outErrorMsg) {
+        *outErrorMsg = nullptr;
+    }
+
+    const long long totalStart = StageNow();
     float* rgba = nullptr;
     int width = 0;
     int height = 0;
-    const char* err = nullptr;
 
-    int ret = LoadEXR(&rgba, &width, &height, filename, &err);
-
+    // Null layer keeps LoadEXR's default filter. The buffer is malloc'd.
+    int ret = LoadMappedInterleavedRgba(
+        filename, nullptr, &rgba, &width, &height, nullptr, outErrorMsg);
     if (ret != TINYEXR_SUCCESS) {
-        if (outErrorMsg) {
-            *outErrorMsg = DuplicateString(err ? err : "Unknown error loading EXR");
-        }
-        if (err) FreeEXRErrorMessage(err);
         return ret;
     }
 
-    // Apply gamma correction
+    // Gamma and flip still see four channels, matching the previous order.
+    long long stageStart = StageNow();
     if (options->gammaCorrection != 1.0f) {
         ApplyGamma(rgba, width, height, 4, options->gammaCorrection);
     }
+    LogStage("gamma", StageElapsedMs(stageStart));
 
-    // Flip vertically for Unity
+    stageStart = StageNow();
     if (options->flipY) {
         FlipVertical(rgba, width, height, 4);
     }
+    LogStage("flip", StageElapsedMs(stageStart));
 
-    // Handle channel conversion
+    // Optional RGB strip. malloc, not new[], so FreeImageData can free() it.
     if (options->targetChannels == 3) {
-        float* rgb = new float[width * height * 3];
-        for (int i = 0; i < width * height; i++) {
+        const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+        if (pixelCount > (std::numeric_limits<size_t>::max() / 3) / sizeof(float)) {
+            free(rgba);
+            PublishError("Image dimensions are too large to allocate", nullptr, outErrorMsg);
+            return TINYEXR_ERROR_DATA_TOO_LARGE;
+        }
+        stageStart = StageNow();
+        float* rgb = static_cast<float*>(malloc(pixelCount * 3 * sizeof(float)));
+        LogStage("alloc_channels", StageElapsedMs(stageStart));
+        if (!rgb) {
+            free(rgba);
+            PublishError("Failed to allocate RGB buffer", nullptr, outErrorMsg);
+            return TINYEXR_ERROR_INVALID_DATA;
+        }
+        stageStart = StageNow();
+        for (size_t i = 0; i < pixelCount; i++) {
             rgb[i * 3 + 0] = rgba[i * 4 + 0];
             rgb[i * 3 + 1] = rgba[i * 4 + 1];
             rgb[i * 3 + 2] = rgba[i * 4 + 2];
         }
+        LogStage("channel_convert", StageElapsedMs(stageStart));
         free(rgba);
         rgba = rgb;
         outInfo->numChannels = 3;
         outInfo->hasAlpha = 0;
     } else {
+        LogStage("alloc_channels", 0.0);
+        LogStage("channel_convert", 0.0);
         outInfo->numChannels = 4;
         outInfo->hasAlpha = 1;
     }
@@ -646,9 +684,8 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithOptionsForUnity(
     outInfo->width = width;
     outInfo->height = height;
     outInfo->pixelType = 2; // FLOAT
-
     *outData = rgba;
-    if (outErrorMsg) *outErrorMsg = nullptr;
+    LogStage("total", StageElapsedMs(totalStart));
     return TINYEXR_SUCCESS;
 }
 
@@ -667,32 +704,33 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRLayerForUnity(
         return TINYEXR_ERROR_INVALID_ARGUMENT;
     }
 
+    *outData = nullptr;
+    if (outErrorMsg) {
+        *outErrorMsg = nullptr;
+    }
+
     float* rgba = nullptr;
     int width = 0;
     int height = 0;
-    const char* err = nullptr;
 
-    int ret = LoadEXRWithLayer(&rgba, &width, &height, filename, layerName, &err);
-
+    // Named layer uses the same map and interleave as the default load.
+    int ret = LoadMappedInterleavedRgba(
+        filename, layerName, &rgba, &width, &height, nullptr, outErrorMsg);
     if (ret != TINYEXR_SUCCESS) {
-        if (outErrorMsg) {
-            *outErrorMsg = DuplicateString(err ? err : "Failed to load layer");
-        }
-        if (err) FreeEXRErrorMessage(err);
         return ret;
     }
 
-    // Flip for Unity
+    // Previous success path always flipped and returned four float channels.
+    long long stageStart = StageNow();
     FlipVertical(rgba, width, height, 4);
+    LogStage("flip", StageElapsedMs(stageStart));
 
     outInfo->width = width;
     outInfo->height = height;
     outInfo->numChannels = 4;
     outInfo->pixelType = 2;
     outInfo->hasAlpha = 1;
-
     *outData = rgba;
-    if (outErrorMsg) *outErrorMsg = nullptr;
     return TINYEXR_SUCCESS;
 }
 
@@ -803,9 +841,11 @@ UNITY_TINYEXR_API int UNITY_CALL GetEXRLayerInfo(
 }
 
 // Copy decoded planes into malloc'd RGBA. Matches LoadEXR() channel order.
+// layerName null or empty selects LoadEXR's default layer filter ("").
 static int InterleaveDecodedToRgba(
     const EXRHeader& header,
     const EXRImage& image,
+    const char* layerName,
     float** outRgba,
     int* outWidth,
     int* outHeight,
@@ -823,12 +863,20 @@ static int InterleaveDecodedToRgba(
     int idxRY = -1;
     int idxBY = -1;
 
+    // Empty and null both mean "channels with no layer prefix", same as LoadEXR().
+    const bool defaultLayer = (layerName == nullptr || layerName[0] == '\0');
+    const std::string layer = defaultLayer ? std::string() : std::string(layerName);
+
     std::vector<tinyexr::LayerChannel> channels;
-    tinyexr::ChannelsInLayer(header, "", channels);
+    tinyexr::ChannelsInLayer(header, layer, channels);
     if (channels.size() < 1) {
-        tinyexr::SetErrorMessage(
-            "Layer Not Found. Seems EXR contains channels with layer(e.g. `diffuse.R`). if you are using LoadEXR(), please try LoadEXRWithLayer(). LoadEXR() cannot load EXR having channels with layer.",
-            err);
+        if (defaultLayer) {
+            tinyexr::SetErrorMessage(
+                "Layer Not Found. Seems EXR contains channels with layer(e.g. `diffuse.R`). if you are using LoadEXR(), please try LoadEXRWithLayer(). LoadEXR() cannot load EXR having channels with layer.",
+                err);
+        } else {
+            tinyexr::SetErrorMessage("Layer Not Found", err);
+        }
         return TINYEXR_ERROR_LAYER_NOT_FOUND;
     }
 
@@ -966,52 +1014,33 @@ static void PublishError(const char* fallback, const char* tinyErr, char** outEr
     }
 }
 
-// Load EXR with resize
-// public API
-UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
+// Map the file once, decode to planar images, then interleave to malloc'd RGBA.
+// The map ends before interleave so its pages are not held with the RGBA buffer.
+// layerName null or empty uses LoadEXR's default layer. On failure every native
+// buffer is released and outErrorMsg is published the same way as the resize path.
+static int LoadMappedInterleavedRgba(
     const char* filename,
-    int targetWidth,
-    int targetHeight,
-    float** outData,
-    UnityImageInfo* outInfo,
-    UnityConversionOptions* options,
+    const char* layerName,
+    float** outRgba,
+    int* outWidth,
+    int* outHeight,
+    double* outInterleaveAllocMs,
     char** outErrorMsg
 ) {
-    if (!filename || !outData || !outInfo || !options) {
-        if (outErrorMsg) {
-            *outErrorMsg = DuplicateString("Invalid parameters");
-        }
-        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    *outRgba = nullptr;
+    *outWidth = 0;
+    *outHeight = 0;
+    if (outInterleaveAllocMs) {
+        *outInterleaveAllocMs = 0.0;
     }
 
-    // Clear outputs so a failed call never leaves a dangling pointer.
-    *outData = nullptr;
-    if (outErrorMsg) {
-        *outErrorMsg = nullptr;
-    }
-
-    if (targetWidth <= 0 || targetHeight <= 0) {
-        if (outErrorMsg) {
-            *outErrorMsg = DuplicateString("Invalid target dimensions");
-        }
-        return TINYEXR_ERROR_INVALID_ARGUMENT;
-    }
-
-    const long long totalStart = StageNow();
-    double allocMs = 0.0;
-    float* rgba = nullptr;
-    float* resizedData = nullptr;
-    int width = 0;
-    int height = 0;
     const char* err = nullptr;
-
     EXRHeader exrHeader;
     EXRImage exrImage;
     InitEXRHeader(&exrHeader);
     InitEXRImage(&exrImage);
 
-    // Map once. The map ends before interleave so its pages are not held
-    // together with the full-resolution RGBA buffer.
+    // Map once. Header parse and pixel decode share this view of the file.
     {
         long long stageStart = StageNow();
         MemoryMappedFile mapped(filename);
@@ -1070,22 +1099,77 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
         }
     }
 
+    // Interleave after the map is gone. YCA, grayscale, and tiled order match LoadEXR().
     double interleaveAllocMs = 0.0;
     long long stageStart = StageNow();
     int ret = InterleaveDecodedToRgba(
-        exrHeader, exrImage, &rgba, &width, &height, &interleaveAllocMs, &err);
+        exrHeader, exrImage, layerName, outRgba, outWidth, outHeight, &interleaveAllocMs, &err);
     const double interleaveMs = StageElapsedMs(stageStart) - interleaveAllocMs;
-    allocMs += interleaveAllocMs;
+    if (outInterleaveAllocMs) {
+        *outInterleaveAllocMs = interleaveAllocMs;
+    }
     LogStage("alloc_interleaved", interleaveAllocMs);
     LogStage("interleave", interleaveMs < 0.0 ? 0.0 : interleaveMs);
     FreeEXRHeader(&exrHeader);
     FreeEXRImage(&exrImage);
     if (ret != TINYEXR_SUCCESS) {
+        // Interleave frees a partial RGBA buffer before it returns an error.
+        *outRgba = nullptr;
         PublishError("Unknown error loading EXR", err, outErrorMsg);
         return ret;
     }
+    return TINYEXR_SUCCESS;
+}
+
+// Load EXR with resize
+// public API
+UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
+    const char* filename,
+    int targetWidth,
+    int targetHeight,
+    float** outData,
+    UnityImageInfo* outInfo,
+    UnityConversionOptions* options,
+    char** outErrorMsg
+) {
+    if (!filename || !outData || !outInfo || !options) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid parameters");
+        }
+        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    }
+
+    // Clear outputs so a failed call never leaves a dangling pointer.
+    *outData = nullptr;
+    if (outErrorMsg) {
+        *outErrorMsg = nullptr;
+    }
+
+    if (targetWidth <= 0 || targetHeight <= 0) {
+        if (outErrorMsg) {
+            *outErrorMsg = DuplicateString("Invalid target dimensions");
+        }
+        return TINYEXR_ERROR_INVALID_ARGUMENT;
+    }
+
+    const long long totalStart = StageNow();
+    double allocMs = 0.0;
+    float* rgba = nullptr;
+    float* resizedData = nullptr;
+    int width = 0;
+    int height = 0;
+
+    // Shared single-map decode. Null layer is LoadEXR's default filter.
+    double interleaveAllocMs = 0.0;
+    int ret = LoadMappedInterleavedRgba(
+        filename, nullptr, &rgba, &width, &height, &interleaveAllocMs, outErrorMsg);
+    if (ret != TINYEXR_SUCCESS) {
+        return ret;
+    }
+    allocMs += interleaveAllocMs;
 
     resizedData = rgba;
+    long long stageStart = 0;
     if (width != targetWidth || height != targetHeight) {
         const size_t dstBytes = RgbaFloatBytes(targetWidth, targetHeight);
         stageStart = StageNow();
@@ -1170,8 +1254,7 @@ UNITY_TINYEXR_API int UNITY_CALL LoadEXRWithResizeForUnity(
 // Memory cleanup functions
 UNITY_TINYEXR_API void UNITY_CALL FreeImageData(float* data) {
     if (data) {
-        // LoadEXR uses malloc, others use new[]
-        // For safety, we'll use free for data from LoadEXR
+        // Image buffers from every Unity load path are malloc'd.
         free(data);
     }
 }
